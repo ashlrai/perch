@@ -4,9 +4,9 @@ A notch for the Windows 11 taskbar that shows what your machine is doing: AI cod
 
 ![perch on the taskbar](docs/notch.png)
 
-Click it, or press **Win+Alt+N**, and your agent sessions, builds, servers and repos float above the taskbar as cards:
+Click it, or press **Win+Alt+N**, and your agent sessions, builds, servers and repos float above the taskbar as cards you can flip through.
 
-![the cards](docs/cards.png)
+> **Early version (0.1).** perch is young: expect rough edges, and please [open an issue](https://github.com/ashlrai/perch/issues) when something looks wrong.
 
 ## Install
 
@@ -33,7 +33,6 @@ The exes aren't code-signed yet, so Windows SmartScreen may ask you to confirm t
 
 You can also switch the card to a step-by-step timeline that flags loops, and type a quick reply.
 
-![an agent card](docs/agent.png)
 
 **Permission requests on the notch.** When Claude Code asks for permission, the notch glows amber and shows **Allow** / **Deny**. **Always** and **10 min** remember the answer for that command in that repository: a Bash rule matches the first two words, such as `npm test`, but never a chained command like `npm test && …`. If you don't answer within 45 s, Claude's own prompt takes over.
 

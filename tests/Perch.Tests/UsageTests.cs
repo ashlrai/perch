@@ -90,5 +90,16 @@ public class UsageTests
     [InlineData(999, "999")]
     [InlineData(45_300, "45k")]
     [InlineData(1_250_000, "1.25M")]
+    [InlineData(23_460_000, "23.5M")]
+    [InlineData(230_690_000, "231M")]
     public void Token_counts_are_short(long n, string s) => Assert.Equal(s, Usage.Tok(n));
+
+    [Fact]
+    public void A_byte_order_mark_does_not_cost_the_first_line()
+    {
+        string p = Path.Combine(Path.GetTempPath(), "perch-test-" + Guid.NewGuid().ToString("N") + ".jsonl");
+        File.WriteAllText(p, User("hello", "2026-11-24T10:00:00.000Z") + "\n", new System.Text.UTF8Encoding(true));
+        try { Assert.Equal("hello", Assert.Single(Usage.ReadOnce(p)!.Events).Text); }
+        finally { File.Delete(p); }
+    }
 }

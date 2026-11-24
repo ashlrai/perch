@@ -199,8 +199,9 @@ static class Cli
         {
             if (Console.IsInputRedirected)
             {
-                var read = Task.Run(() => Console.In.ReadToEnd());
-                string json = (read.Wait(500) ? read.Result : "").Trim().TrimStart('﻿');
+                // always UTF-8, whatever the console's code page (an OEM code page would garble the JSON)
+                var read = Task.Run(() => new StreamReader(Console.OpenStandardInput(), new UTF8Encoding(false)).ReadToEnd());
+                string json = (read.Wait(2000) ? read.Result : "").Trim().TrimStart('﻿');
                 if (json.Length > 0)
                 {
                     using var d = JsonDocument.Parse(json);

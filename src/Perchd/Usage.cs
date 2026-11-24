@@ -67,6 +67,7 @@ static class Usage
         while (n < buf.Length) { int r = fs.Read(buf, n, buf.Length - n); if (r <= 0) break; n += r; }
         int start = 0;
         var span = buf.AsSpan(0, n);
+        if (t.Offset == 0 && span.StartsWith("﻿"u8)) start = 3;   // a byte-order mark isn't part of the first line
         while (true)
         {
             int nl = span[start..].IndexOf((byte)'\n');
@@ -265,5 +266,7 @@ static class Usage
         return used > w ? 1_000_000 : w;
     }
 
-    public static string Tok(long n) => n >= 1_000_000 ? $"{n / 1e6:0.0#}M" : n >= 1000 ? $"{n / 1000}k" : n.ToString();
+    public static string Tok(long n) =>
+        n >= 100_000_000 ? $"{n / 1e6:0}M" : n >= 10_000_000 ? $"{n / 1e6:0.#}M" : n >= 1_000_000 ? $"{n / 1e6:0.0#}M"
+        : n >= 1000 ? $"{n / 1000}k" : n.ToString();
 }

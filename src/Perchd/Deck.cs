@@ -526,7 +526,7 @@ static unsafe partial class App
             switch (e.Kind)
             {
                 case 'p': col = C.Text; g.Text("›", g.FSemi, C.Accent, tx - 2, yy, 10, RH); text = "You: " + text; break;
-                case 'r': col = C.Dim; g.Text("⏺", g.FMonoXs, C.Faint, tx - 3, yy, 12, RH); break;
+                case 'r': col = C.Dim; g.Arc(tx + 2, yy + RH / 2, 3, 0, 360, 1.3f, C.Accent); break;   // a ring: the ⏺ glyph comes out as a colour emoji
                 default:
                     bool loop = n >= 3;
                     col = loop ? C.Warn : C.Dim;
