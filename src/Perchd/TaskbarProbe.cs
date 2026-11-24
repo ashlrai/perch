@@ -1,10 +1,10 @@
 using System.Runtime.InteropServices;
-using static NotchBar.W;
+using static Perch.W;
 
-namespace NotchBar;
+namespace Perch;
 
 /// Where the real taskbar's three groups are on screen (widgets, Start + apps, tray), read through
-/// UI Automation so notchbar can draw its glass boxes exactly behind them. Raw COM vtable calls keep
+/// UI Automation so perch can draw its glass boxes exactly behind them. Raw COM vtable calls keep
 /// this AOT-friendly; it runs on a thread-pool (MTA) thread and posts a message when the layout changes.
 static unsafe class TaskbarProbe
 {

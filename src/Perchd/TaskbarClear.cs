@@ -1,19 +1,19 @@
 using System.Runtime.InteropServices;
-using static NotchBar.W;
+using static Perch.W;
 
-namespace NotchBar;
+namespace Perch;
 
 /// Makes the Windows 11 taskbar's own background invisible, so the glass boxes drawn behind it show.
 ///
-/// The taskbar is XAML inside explorer.exe; its background is two rectangles. notchbar-tap.dll (next to
+/// The taskbar is XAML inside explorer.exe; its background is two rectangles. perch-tap.dll (next to
 /// this exe) is loaded into Explorer through InitializeXamlDiagnosticsEx, the XAML diagnostics API, and
-/// sets just those two to invisible; it puts them back when notchbar exits. The loading runs in a
-/// short-lived second notchbar process (`notchbar --clear-taskbar`) so the main one never maps the
+/// sets just those two to invisible; it puts them back when perch exits. The loading runs in a
+/// short-lived second perch process (`perchd --clear-taskbar`) so the main one never maps the
 /// XAML framework.
 static unsafe class TaskbarClear
 {
     static readonly Guid TapClsid = new("6F1A3B8E-2C4D-4E5F-9A7B-1C2D3E4F5A6B");
-    public static string DllPath => Path.Combine(AppContext.BaseDirectory, "notchbar-tap.dll");
+    public static string DllPath => Path.Combine(AppContext.BaseDirectory, "perch-tap.dll");
 
     /// Start the helper process (returns at once).
     public static void Launch()

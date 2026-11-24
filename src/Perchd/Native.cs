@@ -1,6 +1,6 @@
 using System.Runtime.InteropServices;
 
-namespace NotchBar;
+namespace Perch;
 
 [StructLayout(LayoutKind.Sequential)] struct POINT { public int X, Y; }
 [StructLayout(LayoutKind.Sequential)] struct SIZE { public int W, H; }
@@ -38,6 +38,17 @@ unsafe struct PROCESSENTRY32W
     public int pcPriClassBase;
     public uint dwFlags;
     public fixed char szExeFile[260];
+}
+/// SendInput's INPUT, keyboard variant (x64 layout: the union is 32 bytes, at offset 8).
+[StructLayout(LayoutKind.Explicit, Size = 40)]
+struct INPUT
+{
+    [FieldOffset(0)] public uint Type;
+    [FieldOffset(8)] public ushort Vk;
+    [FieldOffset(10)] public ushort Scan;
+    [FieldOffset(12)] public uint Flags;
+    [FieldOffset(16)] public uint Time;
+    [FieldOffset(24)] public nuint Extra;
 }
 [StructLayout(LayoutKind.Sequential)]
 struct RectF
@@ -135,6 +146,17 @@ static unsafe class W
     [DllImport(U)] public static extern int IsIconic(nint h);
     [DllImport(U)] public static extern int IsZoomed(nint h);
     [DllImport(U)] public static extern int UnhookWinEvent(nint hook);
+    [DllImport(U)] public static extern uint SendInput(uint n, INPUT* inputs, int size);
+    [DllImport(U)] public static extern int GetWindowTextW(nint h, char* buf, int max);
+    [DllImport(U)] public static extern int OpenClipboard(nint h);
+    [DllImport(U)] public static extern int CloseClipboard();
+    [DllImport(U)] public static extern int EmptyClipboard();
+    [DllImport(U)] public static extern nint GetClipboardData(uint fmt);
+    [DllImport(U)] public static extern nint SetClipboardData(uint fmt, nint mem);
+    [DllImport(K)] public static extern nint GlobalAlloc(uint flags, nuint bytes);
+    [DllImport(K)] public static extern nint GlobalLock(nint mem);
+    [DllImport(K)] public static extern int GlobalUnlock(nint mem);
+    [DllImport(U)] public static extern short GetKeyState(int vk);
     [DllImport(U)] public static extern int IsWindowVisible(nint h);
     [DllImport(U)] public static extern int IsWindow(nint h);
     [DllImport(U)] public static extern int GetWindowTextLengthW(nint h);

@@ -1,8 +1,8 @@
 using System.Runtime.InteropServices;
 using System.Text;
-using static NotchBar.W;
+using static Perch.W;
 
-namespace NotchBar;
+namespace Perch;
 
 /// The open state: the notch turns into a slim page switcher and each page's items float above the
 /// taskbar as cards (agent windows, builds, servers, repos), over a dimmed, blurred copy of the desktop.
@@ -213,6 +213,7 @@ static unsafe partial class App
         if (n == null) return;
         FreePreviews(_prev);
         _prev = n;
+        RefreshTermText(false);   // now that the windows are known, read their text
         Invalidate();
     }
 
@@ -261,7 +262,10 @@ static unsafe partial class App
                     hc.Add(StatusText(t, now)); hc.Add(BranchFor(t.Cwd)); hc.Add(t.Log?.Count ?? 0);
                     hc.Add(_prev.TryGetValue(t.Key, out var pv) ? pv.Img : 0);
                     hc.Add(Usage.Get(t.Transcript));
+                    hc.Add(TermText.Get(pv.Hwnd));
                     if (t.Log is { Count: > 0 } lg) hc.Add(lg[^1].Done);
+                    hc.Add(_paneView); hc.Add(_tlScroll); hc.Add(t.AutoN); hc.Add(t.Changes); hc.Add(t.Since);
+                    hc.Add(_confirm == "undo:" + t.Key && Model.Now - _confirmAt < 4000);
                     want.Add(("a" + t.Key, hc.ToHashCode(), i));
                 }
                 break;
@@ -272,16 +276,22 @@ static unsafe partial class App
                     var j = _jobs[i];
                     var last = j.Runs.Count > 0 ? j.Runs[^1] : null;
                     want.Add(("b" + j.Key, HashCode.Combine(j.Label, j.Live?.Running, j.Live?.Code, j.Runs.Count, last?.EndUtc,
-                        j.Live is { Running: true } lt ? Fmt.Clock(now - lt.Start) : last != null ? Fmt.Ago(WallAgo(last)) : ""), i));
+                        j.Live is { Running: true } lt ? Fmt.Clock(now - lt.Start) : last != null ? Fmt.Ago(WallAgo(last)) : "",
+                        HashCode.Combine(FailOutput(j), Fixable(j) != null)), i));
                 }
                 break;
             case 2:
                 for (int i = 0; i < Probe.Servers.Count && want.Count < MaxCards; i++)
-                    want.Add(("p" + Probe.Servers[i].Port, HashCode.Combine(Probe.Servers[i].Proc), i));
+                {
+                    var s = Probe.Servers[i];
+                    var pi = ProcInfo.Get(s.Pid);
+                    want.Add(("p" + s.Port, HashCode.Combine(s.Proc, s.Pid, pi, pi != null ? Uptime(pi.StartUtc) : "",
+                        _confirm == "stop:" + s.Port && Model.Now - _confirmAt < 4000, ProcInfo.LaunchedByCached(s.Pid) != null), i));
+                }
                 break;
             default:
                 for (int i = 0; i < _repos.Count && want.Count < MaxCards; i++)
-                    want.Add(("g" + _repos[i].Root, HashCode.Combine(_repos[i].St, _repos[i].Name), i));
+                    want.Add(("g" + _repos[i].Root, HashCode.Combine(_repos[i].St, _repos[i].Name, _repos[i].Gh), i));
                 break;
         }
         if (want.Count == 0) want.Add(("e" + _tab, _tab, -1));
@@ -375,10 +385,10 @@ static unsafe partial class App
         Face();
         (string t, string s) = _tab switch
         {
-            0 => ("No agent sessions", "Claude Code, Codex, Gemini and other agent CLIs show up here while they run. Run  nb hooks  to connect Claude Code."),
-            1 => ("Nothing built yet", "Prefix a command with  nb run  to follow it here, with a progress bar learned from earlier runs."),
+            0 => ("No agent sessions", "Claude Code, Codex, Gemini and other agent CLIs show up here while they run. Run  perch hooks  to connect Claude Code."),
+            1 => ("Nothing built yet", "Prefix a command with  perch run  to follow it here, with a progress bar learned from earlier runs."),
             2 => ("No dev servers running", "Local listeners from node, bun, python, docker and others show up here."),
-            _ => ("No repositories yet", "Repos show up once you  nb run  in them or an agent works in them, or add  repo = <path>  to the config."),
+            _ => ("No repositories yet", "Repos show up once you  perch run  in them or an agent works in them, or add  repo = <path>  to the config."),
         };
         g.Text(t, g.FTitle, C.Dim, 0, CH / 2 - 40, CW, 26, 1);
         g.TextWrap(s, g.FUi, C.Faint, 90, CH / 2 - 6, CW - 180, 60);
@@ -403,6 +413,83 @@ static unsafe partial class App
         _ => C.Light ? 0xFF3B3C44 : 0xFF1B1C20,
     };
 
+    /// The newest lines of a terminal, wrapped to the pane (monospace, so by character count), bottom-aligned.
+    /// Your prompts (">") and the agent's replies ("⏺") stand out; tool output ("⎿") and chrome stay quiet.
+    static void TermPane(Gfx g, string[] lines, float x, float y, float w, float h)
+    {
+        g.FillRect(x, y, w, h + ReplyH + 14, C.Light ? 0xFFF7F7F9 : 0xFF0B0B0D);
+        const float LH = 13.5f, PAD = 12;
+        float cw = g.Measure("0000000000", g.FMonoXs) / 10;
+        int cols = Math.Max(16, (int)((w - 2 * PAD) / MathF.Max(1, cw)));
+        int maxRows = Math.Max(1, (int)((h - 10) / LH));
+        // wrap from the bottom up until the pane is full
+        var rows = new List<(string Text, uint Col)>();
+        for (int i = lines.Length - 1; i >= 0 && rows.Count < maxRows; i--)
+        {
+            string l = lines[i].Replace('\t', ' ');
+            string lt = l.TrimStart();
+            uint col = lt.StartsWith('>') ? C.Text
+                     : lt.StartsWith('⏺') || lt.StartsWith('●') ? C.Text
+                     : lt.StartsWith('⎿') ? C.Faint
+                     : lt.Length > 0 && "─│╭╮╰╯━┃".Contains(lt[0]) ? C.A(C.Faint, 0.7f)
+                     : C.Dim;
+            if (l.Length == 0) { rows.Add(("", col)); continue; }
+            var chunks = new List<string>();
+            for (int k = 0; k < l.Length; k += cols) chunks.Add(l.Substring(k, Math.Min(cols, l.Length - k)));
+            for (int k = chunks.Count - 1; k >= 0 && rows.Count < maxRows; k--) rows.Add((chunks[k], col));
+        }
+        float yy = y + h - 4 - rows.Count * LH;
+        for (int i = rows.Count - 1; i >= 0; i--, yy += LH)
+            if (rows[i].Text.Length > 0) g.Text(rows[i].Text, g.FMonoXs, rows[i].Col, x + PAD, yy, w - PAD, LH + 2);
+    }
+
+    static int _paneView, _tlScroll;     // agent cards' left pane: 0 terminal, 1 timeline; timeline rows scrolled up (PgUp/PgDn)
+    static string _confirm = ""; static long _confirmAt;   // a destructive button pressed once, waiting for the second press
+
+    /// The session step by step: your prompts, each tool call with how long it took, the agent's replies.
+    /// The same call repeated back to back is folded into one row and flagged: a sign of a loop.
+    static void TimelinePane(Gfx g, Usage.Ev[] evs, float x, float y, float w, float h, long now)
+    {
+        g.FillRect(x, y, w, h + ReplyH + 14, C.Light ? 0xFFF7F7F9 : 0xFF0B0B0D);
+        const float RH = 19, PAD = 12;
+        var rows = new List<(Usage.Ev E, int N)>();
+        foreach (var e in evs)
+        {
+            if (rows.Count > 0 && e.Kind == 't' && rows[^1].E.Kind == 't' && rows[^1].E.Text == e.Text) { rows[^1] = (e, rows[^1].N + 1); continue; }
+            rows.Add((e, 1));
+        }
+        float top = y + 40;   // below the view switch
+        int fit = Math.Max(1, (int)((y + h - 4 - top) / RH));
+        _tlScroll = Math.Clamp(_tlScroll, 0, Math.Max(0, rows.Count - fit));
+        int end = rows.Count - _tlScroll, start = Math.Max(0, end - fit);
+        float yy = y + h - 4 - (end - start) * RH;
+        long nowUtc = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
+        for (int i = start; i < end; i++, yy += RH)
+        {
+            var (e, n) = rows[i];
+            string time = e.T > 0 ? DateTimeOffset.FromUnixTimeMilliseconds(e.T).ToLocalTime().ToString("HH:mm") : "";
+            g.Text(time, g.FMonoXs, C.A(C.Faint, 0.8f), x + PAD, yy, 34, RH);
+            float tx = x + PAD + 40, tw = w - PAD - 40 - 50;
+            uint col; string text = e.Text;
+            switch (e.Kind)
+            {
+                case 'p': col = C.Text; g.Text("›", g.FSemi, C.Accent, tx - 2, yy, 10, RH); text = "You: " + text; break;
+                case 'r': col = C.Dim; g.Text("⏺", g.FMonoXs, C.Faint, tx - 3, yy, 12, RH); break;
+                default:
+                    bool loop = n >= 3;
+                    col = loop ? C.Warn : C.Dim;
+                    if (e.Dur < 0) g.Circle(tx + 2, yy + RH / 2, 2.4f, C.Run);
+                    else g.Circle(tx + 2, yy + RH / 2, 2, C.A(C.Faint, 0.7f));
+                    if (n > 1) text += $"  ×{n}" + (loop ? "  (repeating)" : "");
+                    break;
+            }
+            g.Text(text, e.Kind == 'p' ? g.FSmall : g.FMonoXs, col, tx + 10, yy, tw, RH);
+            string right = e.Kind != 't' ? "" : e.Dur < 0 ? (e.T > 0 ? Fmt.Clock(nowUtc - e.T) : "…") : e.Dur >= 1000 ? Fmt.Dur(e.Dur) : "";
+            if (right.Length > 0) g.Text(right, g.FMonoXs, e.Dur < 0 ? C.Run : C.Faint, x, yy, w - PAD, RH, 2);
+        }
+        if (start > 0) g.Text($"↑ {start} earlier  (PgUp)", g.FMonoXs, C.Faint, x, top - 4, w - PAD, 14, 2);
+    }
+
     static void AgentCard(Card c, in Term t, long now)
     {
         var g = G;
@@ -411,8 +498,15 @@ static unsafe partial class App
         TitleBar(project + " — " + t.Host, false);
         float lw = CW - SideW, top = 31, lh = CH - 31 - 22;
 
-        // left: a picture of the real window, or the activity log when there is none
-        if (_prev.TryGetValue(t.Key, out var pv) && pv.Img != 0)
+        // left: the session's timeline (V), else the terminal's own text (live), else a picture of the window,
+        // else the activity log
+        _prev.TryGetValue(t.Key, out var pv);
+        var tt = TermText.Get(pv.Hwnd);
+        var ut = Usage.Get(t.Transcript);
+        bool hasTl = ut != null && ut.Events.Length > 0;
+        if (hasTl && _paneView == 1) TimelinePane(g, ut!.Events, 0, top, lw, lh - ReplyH - 14, now);
+        else if (tt != null && tt.Lines.Length > 0) TermPane(g, tt.Lines, 0, top, lw, lh - ReplyH - 14);
+        else if (pv.Img != 0)
             g.Image(pv.Img, 0, top, lw, lh, 0, 0, (int)(lw * _s), (int)((CH - 53) * _s), 5);
         else
         {
@@ -472,18 +566,44 @@ static unsafe partial class App
         else if (!t.Hooked)
         {
             g.TextWrap(t.Name.Contains("claude", StringComparison.OrdinalIgnoreCase)
-                ? "Run  nb hooks  and add it to your Claude Code settings to see prompts, tool calls and approvals here."
+                ? "Run  perch hooks  and add it to your Claude Code settings to see prompts, tool calls and approvals here."
                 : "Live prompts and tool calls are shown for Claude Code sessions.", g.FLabel, C.Faint, sx, sy, sw, 64);
             sy += 70;
         }
-        string note = t.State switch { "busy" => Doing(t.Tool) + "…", "wait" => t.Msg, "done" => "Finished. Your turn.", _ => "" };
-        if (note.Length > 0) { g.TextWrap(note, g.FLabel, C.Faint, sx, sy, sw, 30); sy += note.Length > 34 ? 32 : 18; }
+        var ch = t.State == "done" ? t.Changes : null;
+        bool changed = ch is { Count: > 0 };
+        if (changed)
+        {   // what it changed this turn
+            int add = ch!.Sum(x => x.Add), del = ch!.Sum(x => x.Del);
+            g.Text($"Changed {ch.Count} file{(ch.Count == 1 ? "" : "s")}", g.FLabel, C.Dim, sx, sy, sw, 15);
+            g.Text($"+{add}  −{del}", g.FMonoXs, C.Faint, sx, sy, sw, 15, 2);
+            sy += 18;
+            for (int i = 0; i < ch.Count && i < 3; i++)
+            {
+                var (p, a, d) = ch[i];
+                float nw = g.Measure($"+{a} −{d}", g.FMonoXs);
+                g.Text(Fmt.Dir(p), g.FMonoXs, C.Faint, sx, sy, sw - nw - 8, 15);
+                g.Text($"+{a}", g.FMonoXs, C.A(C.Ok, 0.85f), sx, sy, sw - g.Measure($" −{d}", g.FMonoXs), 15, 2);
+                g.Text($" −{d}", g.FMonoXs, C.A(C.Err, 0.85f), sx, sy, sw, 15, 2);
+                sy += 15;
+            }
+            sy += 4;
+        }
+        else
+        {
+            string note = t.State switch { "busy" => Doing(t.Tool) + "…", "wait" => t.Msg, "done" => "Finished. Your turn.", _ => "" };
+            if (note.Length > 0) { g.TextWrap(note, g.FLabel, C.Faint, sx, sy, sw, 30); sy += note.Length > 34 ? 32 : 18; }
+        }
+        if (t.AutoN > 0) { g.Text($"{t.AutoN} approved by your rules", g.FLabel, C.A(C.Ok, 0.8f), sx, sy, sw, 15); sy += 17; }
 
         // the command box, pinned to the bottom of the pane
         var (_, tn, td) = ToolOf(t.Tool);
         string cmd = tn == "Bash" ? "$ " + td : tn.Length > 0 ? tn + "  " + Fmt.Dir(td) : "";
         bool ask = t.AskPort > 0 && t.State == "wait" && t.Verdict.Length == 0;
-        float bh = (cmd.Length > 0 ? 50 : 30) + (ask ? 34 : 0), by = CH - 22 - 12 - bh, bx = sx - 2, bw = sw + 4;
+        // "Always": Bash commands by their first words, other tools by name, in this repo
+        string scope = tn == "Bash" ? Model.RulePrefix(td) : tn;
+        bool rules = ask && scope.Length > 0;
+        float bh = (cmd.Length > 0 ? 50 : 30) + (ask ? 34 : 0) + (rules ? 30 : 0) + (changed ? 34 : 0), by = CH - 22 - 12 - bh, bx = sx - 2, bw = sw + 4;
 
         // the last few tool calls, newest at the bottom, in whatever room is left above the command box
         // (the window picture on the left hides the full log, so it's repeated here in short)
@@ -520,9 +640,23 @@ static unsafe partial class App
         g.Text(st, g.FSmall, col, bx + 26, ly, bw - 34, 15);
         if (ask)
         {
-            float xr = bx + bw - 10, yb = by + bh - 33;
+            float xr = bx + bw - 10, yb = by + bh - 33 - (rules ? 30 : 0);
             xr -= Btn(c, xr, yb, "Allow", true, HK.Allow, t.Key, "A") + 6;
             Btn(c, xr, yb, "Deny", false, HK.Deny, t.Key, "D");
+            if (rules)
+            {   // remember the answer: forever, or for the next 10 minutes
+                xr = bx + bw - 10; yb += 30;
+                string lbl = tn == "Bash" ? "Always “" + (scope.Length > 14 ? scope[..13] + "…" : scope) + "”" : "Always " + tn;
+                xr -= Btn(c, xr, yb, lbl, false, HK.Always, t.Key, "L") + 6;
+                Btn(c, xr, yb, "10 min", false, HK.Timed, t.Key, "T");
+            }
+        }
+        if (changed)
+        {
+            float xr = bx + bw - 10, yb = by + bh - 33;
+            bool sure = _confirm == "undo:" + t.Key && Model.Now - _confirmAt < 4000;
+            xr -= Btn(c, xr, yb, sure ? "Stash them?" : "Undo", !sure ? false : true, HK.Undo, t.Key, "U") + 6;
+            Btn(c, xr, yb, "Review", false, HK.Review, t.Key, "R");
         }
 
         // status bar in the host's colour
@@ -536,9 +670,25 @@ static unsafe partial class App
 
         bool hasWin = _prev.TryGetValue(t.Key, out var pw) && pw.Hwnd != 0;
         if (hasWin) Btn(c, lw - 10, top + 10, "Open in " + t.Host + " ↗", true, HK.Focus, t.Key, "↵");
+        if (hasTl)
+        {   // Terminal / Timeline switch (V)
+            float vx = 10, vy = top + 10;
+            foreach (var (name, v) in new[] { ("Terminal", 0), ("Timeline", 1) })
+            {
+                float w = g.Measure(name, g.FLabel) + 16;
+                bool on = _paneView == v;
+                g.FillRR(vx, vy, w, 22, 6, on ? C.A(C.Face, 0.96f) : C.A(C.Face, 0.6f));
+                g.StrokeRR(vx + 0.5f, vy + 0.5f, w - 1, 21, 5.5f, on ? C.Track : C.Line, 1);
+                g.Text(name, g.FLabel, on ? C.Text : C.Faint, vx, vy, w, 22, 1);
+                c.Hits.Add(new Hit { R = new RectF(vx, vy, w, 22), K = HK.View, Arg = v.ToString() });
+                vx += w + 4;
+            }
+        }
         c.Act = hasWin ? HK.Focus : HK.None; c.Arg = t.Key;
-        c.Chip = t.Host;
-        foreach (var o in _terms) if (o.Key != t.Key && o.Host == t.Host) { c.Chip = t.Host + " · " + project; break; }
+        // the chip is a mini status: project, how long it's been at it, how full its context is
+        string clock = t.State is "busy" or "wait" ? " · " + Fmt.Clock(now - t.Since) : "";
+        string ctx = ut != null && ut.Context > 0 ? $" · {ut.Context * 100 / Math.Max(1, Usage.Window(ut.Model, ut.Context, _cfg.ContextWindow))}%" : "";
+        c.Chip = (t.Cwd.Length > 0 ? project : t.Host) + clock + ctx;
         c.ChipCol = t.Verdict == "allow" ? C.Text : StateWord(t).Item2;
     }
 
@@ -601,7 +751,7 @@ static unsafe partial class App
         y += 32;
         g.Text(j.Label, g.FMonoXl, C.Text, x, y, w, 30);
         y += 32;
-        string where = (j.Cwd.Length > 0 ? ShortPath(j.Cwd) + " · " : "") + (j.Cmd.Length > 0 && j.Cmd != j.Label ? j.Cmd : "via nb run");
+        string where = (j.Cwd.Length > 0 ? ShortPath(j.Cwd) + " · " : "") + (j.Cmd.Length > 0 && j.Cmd != j.Label ? j.Cmd : "via perch run");
         g.Text(where, g.FSmall, C.Faint, x, y, w, 18);
         y += 32;
         long eta = Model.EtaFor(j.Label);
@@ -616,9 +766,24 @@ static unsafe partial class App
         g.Text(right, g.FMono, running || ok ? C.Dim : col, x + w / 2, y, w / 2, 18, 2);
         y += 34;
 
+        // a failure with its output: the end of what it printed, the first line that looks like the error picked out
+        string outp = !running && !ok && !lost ? FailOutput(j) : "";
+        if (outp.Length > 0)
+        {
+            var lines = outp.Split('\n');
+            int errAt = Array.FindIndex(lines, l => ErrorLine.IsMatch(l));
+            float boxT = y - 6, boxB = CH - 24 - 25 - 10;
+            g.FillRR(x - 8, boxT, w + 16, boxB - boxT, 8, C.Light ? 0xFFF4F4F6 : 0xFF0B0B0D);
+            int fit = (int)((boxB - boxT - 10) / 14);
+            int s0 = Math.Max(0, lines.Length - fit);
+            if (errAt >= 0 && errAt < s0) s0 = Math.Max(0, Math.Min(errAt, lines.Length - fit));   // keep the error line in view
+            float ly = boxT + 6;
+            for (int i = s0; i < lines.Length && i < s0 + fit; i++, ly += 14)
+                g.Text(lines[i], g.FMonoXs, i == errAt ? C.Err : C.Dim, x, ly, w, 14);
+        }
         // history: one bar per earlier run, height = how long it took, colour = how it ended
         var hist = j.Runs;
-        if (hist.Count > 0)
+        if (hist.Count > 0 && outp.Length == 0)
         {
             int n = Math.Min(hist.Count, 24);
             long max = 1;
@@ -638,7 +803,8 @@ static unsafe partial class App
         }
         float by = CH - 24 - 25, xr = CW - 26;
         if (j.Cwd.Length > 0) xr -= Btn(c, xr, by, "Terminal ↗", false, HK.Repo, j.Cwd) + 8;
-        if (!running && (j.Cmd.Length > 0 || j.Label.Length > 0)) Btn(c, xr, by, "Run again", true, HK.Rerun, j.Key, "↵");
+        if (!running && (j.Cmd.Length > 0 || j.Label.Length > 0)) xr -= Btn(c, xr, by, "Run again", outp.Length == 0, HK.Rerun, j.Key, "↵") + 8;
+        if (outp.Length > 0) Btn(c, xr, by, Fixable(j) != null ? "Fix with Claude" : "Fix in new Claude", true, HK.Fix, j.Key, "F");
         FaceEdge();
         c.Act = !running ? HK.Rerun : j.Cwd.Length > 0 ? HK.Repo : HK.None;
         c.Arg = c.Act == HK.Rerun ? j.Key : j.Cwd;
@@ -646,14 +812,65 @@ static unsafe partial class App
         c.ChipCol = running ? C.Run : col;
     }
 
-    /// Run a job's command again, in a new terminal tab in its folder, through nb so it shows up here.
+    static readonly System.Text.RegularExpressions.Regex ErrorLine = new(
+        @"\b(error|failed|failure|exception|panic|traceback|cannot|fatal|undefined)\b|✕|✗|×|\bFAIL\b|^E\s",
+        System.Text.RegularExpressions.RegexOptions.IgnoreCase | System.Text.RegularExpressions.RegexOptions.CultureInvariant);
+
+    /// The saved output of a job's most recent failure ("" if its last run passed or nothing was captured).
+    static string FailOutput(Job j)
+    {
+        if (j.Live is { Running: false, Output.Length: > 0 } t && t.Code != 0) return t.Output;
+        if (j.Runs.Count > 0 && j.Runs[^1].Code == 0) return "";
+        return Model.LastOutput.TryGetValue(j.Key, out var o) ? o : "";
+    }
+
+    /// A Claude Code session in the same repo that a fix request can be typed into.
+    static string? Fixable(Job j)
+    {
+        string root = Model.FindRoot(j.Cwd) ?? j.Cwd;
+        foreach (var t in _terms)
+            if (t.Hooked && t.Name.Contains("claude", StringComparison.OrdinalIgnoreCase) && CanReply(t) && t.Cwd.Length > 0
+                && string.Equals(Model.FindRoot(t.Cwd) ?? t.Cwd, root, StringComparison.OrdinalIgnoreCase)) return t.Key;
+        return null;
+    }
+
+    /// "Fix with Claude": write the failure to a file and ask the repo's Claude session to read it and fix the
+    /// cause; with no session there, start one (`claude "<prompt>"` in a new terminal tab).
+    static void FixWithClaude(string key)
+    {
+        var j = _jobs.Find(x => x.Key == key);
+        if (j == null) return;
+        string outp = FailOutput(j);
+        string cmd = j.Cmd.Length > 0 ? j.Cmd : j.Label;
+        int code = j.Runs.Count > 0 ? j.Runs[^1].Code : 1;
+        string dir = Path.Combine(Path.GetTempPath(), "perch");
+        string file = Path.Combine(dir, $"failure-{DateTime.Now:yyyyMMdd-HHmmss}.log");
+        try { Directory.CreateDirectory(dir); File.WriteAllText(file, $"command: {cmd}\nfolder: {j.Cwd}\nexit code: {code}\n\n--- end of output ---\n{outp}\n"); }
+        catch { return; }
+        string prompt = $"`{cmd}` failed (exit {code}). The end of its output is in {file} . Read it, find the cause and fix it.";
+        if (Fixable(j) is { } agent) { SendTo(agent, prompt); return; }
+        Collapse(false);
+        string dirq = Directory.Exists(j.Cwd) ? j.Cwd : Environment.GetFolderPath(Environment.SpecialFolder.UserProfile);
+        string arg = prompt.Replace("\"", "'");
+        // through cmd: an npm-installed `claude` is a .cmd script
+        if (ShellExecuteW(0, "open", "wt.exe", $"-w 0 nt -d \"{dirq}\" cmd /k claude \"{arg.Replace(";", "\\;")}\"", null, 1) <= 32)
+            ShellExecuteW(0, "open", Environment.GetEnvironmentVariable("ComSpec") ?? "cmd.exe", $"/k claude \"{arg}\"", dirq, 1);
+    }
+
+    /// Run a job's command again, in a new terminal tab in its folder, through perch so it shows up here.
     static void Rerun(string key)
     {
         var j = _jobs.Find(x => x.Key == key);
         if (j == null) return;
+        RunJob(j.Label, j.Cmd, j.Cwd);
+    }
+
+    static void RunJob(string label, string jcmd, string cwd)
+    {
+        var j = new Job { Label = label, Cmd = jcmd, Cwd = cwd };
         string cmd = j.Cmd.Length > 0 ? j.Cmd : j.Label;
-        string nb = Path.Combine(AppContext.BaseDirectory, "nb.exe");
-        string inner = $"\"{nb}\" run" + (j.Label != cmd ? $" -n \"{j.Label.Replace("\"", "'")}\"" : "") + " -- " + cmd;
+        string perch = Path.Combine(AppContext.BaseDirectory, "perch.exe");
+        string inner = $"\"{perch}\" run" + (j.Label != cmd ? $" -n \"{j.Label.Replace("\"", "'")}\"" : "") + " -- " + cmd;
         string dir = Directory.Exists(j.Cwd) ? j.Cwd : Environment.GetFolderPath(Environment.SpecialFolder.UserProfile);
         Collapse(false);
         // Windows Terminal reads ';' as "new tab": escape it. cmd /s /k "..." strips exactly the outer quotes.
@@ -676,18 +893,59 @@ static unsafe partial class App
         y += 28;
         g.Text(":" + port, g.FMonoHuge, C.Text, x - 3, y, w, 52);
         y += 56;
-        g.Text(s.Proc, g.FUi, C.Dim, x, y, w, 20);
-        y += 38;
-        foreach (var (k, v) in new[] { ("Process", s.Proc), ("Address", "127.0.0.1:" + port), ("URL", "http://localhost:" + port) })
+        var pi = ProcInfo.Get(s.Pid);
+        var by = ProcInfo.LaunchedByCached(s.Pid);
+        string folder = pi is { Cwd.Length: > 0 } ? ShortPath(pi.Cwd) : "";
+        g.Text(folder.Length > 0 ? Fmt.Dir(pi!.Cwd) : s.Proc, g.FUi, C.Dim, x, y, w, 20);
+        y += 34;
+        var rows = new List<(string, string)> { ("Process", s.Proc + (s.Pid > 4 ? $"  ·  pid {s.Pid}" : "")) };
+        if (folder.Length > 0) rows.Add(("Folder", folder));
+        if (pi is { StartUtc: > 0 }) rows.Add(("Up", Uptime(pi.StartUtc)));
+        if (by != null) rows.Add(("Started by", "perch run " + (by.Cmd.Length > 0 ? by.Cmd : by.Label)));
+        rows.Add(("URL", "http://localhost:" + port));
+        foreach (var (k, v) in rows)
         {
-            g.Text(k, g.FUi, C.Faint, x, y, 90, 20);
-            g.Text(v, k == "Process" ? g.FUi : g.FMono, C.Text, x + 96, y, w - 96, 20);
-            y += 27;
+            g.Text(k, g.FSmall, C.Faint, x, y, 90, 20);
+            g.Text(v, k is "Process" or "Up" ? g.FSmall : g.FMonoSm, C.Text, x + 96, y, w - 96, 20);
+            y += 24;
         }
-        Btn(c, CW - 26, CH - 24 - 25, "Open ↗", true, HK.Server, port);
+        float bx = CW - 26, byy = CH - 24 - 25;
+        bx -= Btn(c, bx, byy, "Open ↗", true, HK.Server, port, "↵") + 8;
+        if (s.Pid > 4)
+        {   // stopping is destructive: the first press arms it, the second (within 4 s) does it
+            bool sure = _confirm == "stop:" + port && Model.Now - _confirmAt < 4000;
+            bx -= Btn(c, bx, byy, sure ? "Stop it?" : "Stop", sure, HK.Stop, port) + 8;
+            if (by != null) Btn(c, bx, byy, "Restart", false, HK.Restart, port);
+        }
         FaceEdge();
         c.Act = HK.Server; c.Arg = port;
         c.Chip = ":" + port; c.ChipCol = C.Ok;
+    }
+
+    static string Uptime(long startUtc)
+    {
+        long ms = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds() - startUtc;
+        return ms < 60_000 ? "just started" : Fmt.Dur(ms - ms % 60_000);
+    }
+
+    /// Stop a dev server (its process and everything it started).
+    static void StopServer(string port, bool restart)
+    {
+        var s = Probe.Servers.Find(x => x.Port.ToString() == port);
+        if (s.Pid <= 4) return;
+        var by = restart ? ProcInfo.LaunchedByCached(s.Pid) : null;
+        if (by != null)
+        {   // started with perch run: end that run's whole tree (perch reports it), then run the command again
+            ProcInfo.KillTree(by.Pid, keepRoot: true);
+            string label = by.Label, cmd = by.Cmd, cwd = by.Cwd;
+            Thread.Sleep(700);   // let the port go
+            RunJob(label, cmd, cwd);
+        }
+        else ProcInfo.KillTree(s.Pid);
+        _confirm = "";
+        Model.Note = (restart ? "Restarting :" : "Stopped :") + port; Model.NoteAt = Model.Now;
+        Probe.PollLight(_cfg);
+        Invalidate();
     }
 
     // ---- git
@@ -715,8 +973,10 @@ static unsafe partial class App
             g.Text(ch, g.FSmall, C.Warn, x, y, w, 18); col = C.Warn;
         }
         y += 30;
+        var gh = r.Gh;
+        bool ghRows = gh != null && (gh.RunId != 0 || gh.Pr != 0);
         if (st != null)
-            for (int i = 0; i < st.Files.Count && i < 5; i++)
+            for (int i = 0; i < st.Files.Count && i < (ghRows ? 2 : 5); i++)
             {
                 var (code, path) = st.Files[i];
                 uint cc = code switch { 'A' => C.Ok, 'D' => C.Err, 'U' => C.Err, '?' => C.Faint, 'R' => C.Dim, _ => C.Warn };
@@ -725,8 +985,38 @@ static unsafe partial class App
                 g.Line(x, y + 26.5f, x + w, y + 26.5f, 1, C.Hair);
                 y += 27;
             }
-        g.Text(ShortPath(r.Root), g.FLabel, C.Faint, x, CH - 24 - 25, w - 120, 25);
-        Btn(c, CW - 26, CH - 24 - 25, "Terminal ↗", false, HK.Repo, r.Root);
+        float bxr = CW - 26, byy = CH - 24 - 25;
+        if (ghRows)
+        {   // GitHub: the branch's latest workflow run and its pull request
+            float gy = byy - 16 - (gh!.RunId != 0 && gh.Pr != 0 ? 52 : 26);
+            if (gh.RunId != 0)
+            {
+                (string word, uint cc) = gh.RunStatus != "completed" ? ("running", C.Run)
+                    : gh.RunConclusion switch { "success" => ("passing", C.Ok), "failure" => ("failing", C.Err), "cancelled" => ("cancelled", C.Faint), var o => (o, C.Warn) };
+                g.Circle(x + 4, gy + 13, 3.5f, cc);
+                g.Text("CI " + word, g.FSemi, cc, x + 16, gy, 120, 26);
+                g.Text(gh.RunName, g.FSmall, C.Faint, x + 110, gy, w - 110, 26);
+                if (gh.RunUrl.Length > 0) c.Hits.Add(new Hit { R = new RectF(x, gy, w, 26), K = HK.Link, Arg = gh.RunUrl });
+                gy += 26;
+            }
+            if (gh.Pr != 0)
+            {
+                (string rv, uint rc) = gh.PrReview switch
+                {
+                    "APPROVED" => ("approved", C.Ok), "CHANGES_REQUESTED" => ("changes requested", C.Warn),
+                    "REVIEW_REQUIRED" => ("review required", C.Dim), _ => (gh.PrState.ToLowerInvariant(), C.Dim),
+                };
+                g.Text($"#{gh.Pr}", g.FMonoSm, C.Dim, x, gy, 50, 26);
+                float rw = g.Measure(rv, g.FSmall);
+                g.Text(gh.PrTitle, g.FSmall, C.Text, x + 50, gy, w - 60 - rw, 26);
+                g.Text(rv, g.FSmall, rc, x, gy, w, 26, 2);
+                gy += 26;
+            }
+            if (gh.PrUrl.Length > 0) bxr -= Btn(c, bxr, byy, "PR ↗", false, HK.Link, gh.PrUrl) + 8;
+            else if (gh.RunUrl.Length > 0) bxr -= Btn(c, bxr, byy, "Checks ↗", false, HK.Link, gh.RunUrl) + 8;
+        }
+        g.Text(ShortPath(r.Root), g.FLabel, C.Faint, x, byy, bxr - x - 100, 25);
+        Btn(c, bxr, byy, "Terminal ↗", false, HK.Repo, r.Root);
         FaceEdge();
         c.Act = HK.Repo; c.Arg = r.Root;
         c.Chip = r.Name; c.ChipCol = col;
@@ -807,6 +1097,7 @@ static unsafe partial class App
             {
                 float x0 = MathF.Round((ccx - CW / 2) * _s) / _s, y0 = MathF.Round((ccy - CH / 2) * _s) / _s;
                 g.Image(c.Img, x0, y0, CW, CH, 0, 0, iw, ih, 5);
+                if (c.Key.StartsWith('a')) ReplyBar(g, x0, y0, c, hr);   // live, over the cached face
                 if (settled)
                 {
                     foreach (var h in c.Hits) _dhits.Add(new Hit { R = new RectF(h.R.X + x0, h.R.Y + y0, h.R.W, h.R.H), K = h.K, Arg = h.Arg });
@@ -841,6 +1132,13 @@ static unsafe partial class App
             _dhits.Add(new Hit { R = new RectF(chx, chy, cw[i], ChipH), K = HK.Chip, Arg = i.ToString() });
             chx += cw[i] + 8;
         }
+        if (_tab == 0 && Usage.Totals is { Week: > 0 } tot)
+        {   // token use across every Claude Code session: today and the last 7 days
+            string s = $"Today {Usage.Tok(tot.Today)}  ·  7 days {Usage.Tok(tot.Week)} tokens";
+            float tw = g.Measure(s, g.FLabel) + 22, tx = chx + 10, ty = chy + 3;   // after the chips, on their row
+            g.FillRR(tx, ty, tw, 22, 11, C.ChipOff);
+            g.Text(s, g.FLabel, C.Dim, tx, ty, tw, 22, 1);
+        }
         g.Flush();
 
         int wx = _mon.L + (int)MathF.Round(L * _s), wy = _mon.T + (int)MathF.Round(T * _s);
@@ -858,7 +1156,11 @@ static unsafe partial class App
     static void ReorderHits()
     {
         _dhits.Sort((a, b) => Rank(a.K).CompareTo(Rank(b.K)));
-        static int Rank(HK k) => k switch { HK.Allow or HK.Deny => 0, HK.Card => 3, HK.Chip => 0, _ when k is HK.Focus or HK.Server or HK.Repo or HK.Rerun => 1, _ => 2 };
+        static int Rank(HK k) => k switch
+        {
+            HK.Allow or HK.Deny or HK.Reply or HK.Always or HK.Timed or HK.Review or HK.Undo or HK.View or HK.Fix or HK.Stop or HK.Restart or HK.Link => 0,
+            HK.Card => 3, HK.Chip => 0, _ when k is HK.Focus or HK.Server or HK.Repo or HK.Rerun => 1, _ => 2,
+        };
     }
 
     // ================================================================ input
@@ -904,6 +1206,17 @@ static unsafe partial class App
                 }
                 break;
             case HK.Rerun: Rerun(arg); break;
+            case HK.Reply: StartCompose(arg); break;
+            case HK.Always: case HK.Timed: AllowByRule(arg, k == HK.Timed ? 10 : 0); break;
+            case HK.Review: ReviewChanges(arg); break;
+            case HK.Undo:
+                if (Armed("undo:" + arg)) UndoChanges(arg);
+                break;
+            case HK.View: _paneView = int.Parse(arg); _tlScroll = 0; Invalidate(); break;
+            case HK.Fix: FixWithClaude(arg); break;
+            case HK.Stop: if (Armed("stop:" + arg)) StopServer(arg, false); break;
+            case HK.Restart: StopServer(arg, true); break;
+            case HK.Link: Collapse(false); ShellExecuteW(0, "open", arg, null, null, 1); break;
             case HK.Server: Collapse(false); ShellExecuteW(0, "open", "http://localhost:" + arg, null, null, 1); break;
             case HK.Repo:
                 Collapse(false);
@@ -918,6 +1231,8 @@ static unsafe partial class App
         i = Math.Clamp(i, 0, _cards.Count - 1);
         if (i == _focus[_tab]) return;
         _focus[_tab] = i;
+        _compose = null; _composeKey = "";
+        if (_tab == 0) RefreshTermText(true);
         _dhk = HK.None; _dharg = null;
         Invalidate();
     }
@@ -945,13 +1260,81 @@ static unsafe partial class App
                     if (_viaHotkey && !Model.Agents.Exists(a => a.AskPort > 0 && a.State == "wait")) Collapse();
                 }
                 break;
-            case 0x52:                                                           // R: run the focused build again
+            case 0x52:                                                           // R: run the focused build again / review an agent's changes
                 if (_tab == 1 && _focus[1] < _cards.Count && _cards[_focus[1]] is { Act: HK.Rerun } rc) Rerun(rc.Arg);
+                else if (FocusedTerm() is { State: "done", Changes.Count: > 0 } rt) ReviewChanges(rt.Key);
+                break;
+            case 0x4C: case 0x54:                                                // L / T: allow always / for 10 minutes
+                if (FocusedTerm() is { AskPort: > 0, State: "wait" } lt && lt.Verdict.Length == 0) AllowByRule(lt.Key, vk == 0x54 ? 10 : 0);
+                break;
+            case 0x55:                                                           // U (twice): stash the agent's changes
+                if (FocusedTerm() is { State: "done", Changes.Count: > 0 } ut && Armed("undo:" + ut.Key)) UndoChanges(ut.Key);
+                break;
+            case 0x56:                                                           // V: terminal / timeline
+                if (_tab == 0) { _paneView ^= 1; _tlScroll = 0; Invalidate(); }
+                break;
+            case 0x21: case 0x22:                                                // PgUp / PgDn: scroll the timeline
+                if (_tab == 0 && _paneView == 1) { _tlScroll = Math.Max(0, _tlScroll + (vk == 0x21 ? 6 : -6)); Invalidate(); }
+                break;
+            case 0x46:                                                           // F: fix a failed build with Claude
+                if (_tab == 1 && _focus[1] < _cards.Count && _cards[_focus[1]].Hits.Exists(h => h.K == HK.Fix)) FixWithClaude(_cards[_focus[1]].Arg);
                 break;
         }
     }
 
-    /// Answer a waiting PermissionRequest hook (nb listens on the port it reported).
+    static Term? FocusedTerm() => _tab == 0 && _focus[0] < _terms.Count ? _terms[_focus[0]] : null;
+
+    /// Two-press safety for destructive buttons: true on the second press within 4 s.
+    static bool Armed(string what)
+    {
+        long now = Model.Now;
+        if (_confirm == what && now - _confirmAt < 4000) { _confirm = ""; return true; }
+        _confirm = what; _confirmAt = now;
+        Invalidate();
+        return false;
+    }
+
+    /// Allow the waiting request, and remember it as a rule (Bash: by command prefix; others: by tool), in this repo.
+    static void AllowByRule(string key, int minutes)
+    {
+        var a = Model.Agents.Find(x => x.Key == key);
+        if (a == null || a.AskPort <= 0) return;
+        var (_, tn, td) = ToolOf(a.Tool);
+        string prefix = tn == "Bash" ? Model.RulePrefix(td) : "";
+        if (tn.Length == 0 || (tn == "Bash" && prefix.Length == 0)) return;
+        Model.AddRule(a.Cwd, tn, prefix, minutes);
+        SendVerdict(key, true);
+        Model.Note = (tn == "Bash" ? $"Allowing “{prefix}”" : $"Allowing {tn}") + (minutes > 0 ? $" for {minutes} min" : " from now on") + " in " + Fmt.Dir(a.Cwd);
+        Model.NoteAt = Model.Now;
+        if (_viaHotkey && !Model.Agents.Exists(x => x.AskPort > 0 && x.State == "wait")) Collapse();
+    }
+
+    static void ReviewChanges(string key)
+    {
+        var a = Model.Agents.Find(x => x.Key == key);
+        if (a == null || a.Changes is not { Count: > 0 } ch) return;
+        string root = Model.FindRoot(a.Cwd) ?? a.Cwd;
+        string files = string.Join(' ', ch.Select(x => "\"" + x.Path + "\""));
+        Collapse(false);
+        // the diff in a new terminal tab (untracked new files are listed by status, since diff doesn't show them)
+        string inner = $"git status --short -- {files} && git diff HEAD -- {files}";
+        if (ShellExecuteW(0, "open", "wt.exe", $"-w 0 nt -d \"{root}\" cmd /k {inner.Replace(";", "\\;")}", null, 1) <= 32)
+            ShellExecuteW(0, "open", Environment.GetEnvironmentVariable("ComSpec") ?? "cmd.exe", "/k " + inner, root, 1);
+    }
+
+    static void UndoChanges(string key)
+    {
+        var a = Model.Agents.Find(x => x.Key == key);
+        if (a == null) return;
+        int n = a.Touched.Count;
+        bool ok = Git.Stash(a, $"perch: undo {AgentTitle(a.Name)} ({DateTime.Now:HH:mm})");
+        Model.Note = ok ? $"Stashed {n} file{(n == 1 ? "" : "s")} · git stash pop brings them back" : "Couldn't stash the changes";
+        Model.NoteAt = Model.Now;
+        if (ok) { a.Changes = new(); a.Touched.Clear(); }
+        Invalidate();
+    }
+
+    /// Answer a waiting PermissionRequest hook (perch listens on the port it reported).
     static void SendVerdict(string key, bool allow)
     {
         var a = Model.Agents.Find(x => x.Key == key);

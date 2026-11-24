@@ -1,10 +1,10 @@
-// notchbar-tap: makes the Windows 11 taskbar's own background invisible so notchbar's glass boxes show.
+// perch-tap: makes the Windows 11 taskbar's own background invisible so perch's glass boxes show.
 //
-// notchbar loads this into explorer.exe with InitializeXamlDiagnosticsEx (the XAML diagnostics API that
+// perch loads this into explorer.exe with InitializeXamlDiagnosticsEx (the XAML diagnostics API that
 // Visual Studio's Live Visual Tree uses). Explorer then creates our "TAP" object and hands it the XAML
 // diagnostics interface; we watch the taskbar's visual tree and set the two rectangles that paint its
 // background (BackgroundFill and BackgroundStroke under Taskbar.TaskbarBackground) to Opacity 0.
-// Nothing else in Explorer is touched. When notchbar exits (its single-instance mutex is released or
+// Nothing else in Explorer is touched. When perch exits (its single-instance mutex is released or
 // abandoned) the rectangles are made visible again.
 
 #include <windows.h>
@@ -47,15 +47,15 @@ static void SetOpacity(double opacity)
     dispatcher->RunAsync(Core::CoreDispatcherPriority_Normal, work.Get(), &action);
 }
 
-/// Wait for notchbar to exit, then give the taskbar its background back.
-static DWORD WINAPI WatchNotchbar(void*)
+/// Wait for perch to exit, then give the taskbar its background back.
+static DWORD WINAPI WatchPerch(void*)
 {
-    HANDLE m = OpenMutexW(SYNCHRONIZE | MUTEX_MODIFY_STATE, FALSE, L"Local\\notchbar.singleton");
+    HANDLE m = OpenMutexW(SYNCHRONIZE | MUTEX_MODIFY_STATE, FALSE, L"Local\\perch.singleton");
     if (m)
     {
         DWORD r = WaitForSingleObject(m, INFINITE);
         if (r == WAIT_OBJECT_0 || r == WAIT_ABANDONED) ReleaseMutex(m);
-        CloseHandle(m);   // promptly: a restarting notchbar checks that this mutex no longer exists
+        CloseHandle(m);   // promptly: a restarting perch checks that this mutex no longer exists
     }
     InterlockedExchange(&g_active, 0);
     SetOpacity(1.0);
@@ -136,9 +136,9 @@ public:
         ComPtr<IXamlDiagnostics> diag;
         if (FAILED(site->QueryInterface(IID_PPV_ARGS(&diag)))) return S_OK;
         InterlockedExchange(&g_active, 1);
-        SetOpacity(0.0);   // loaded again after notchbar restarted: hide what we already know about
+        SetOpacity(0.0);   // loaded again after perch restarted: hide what we already know about
         if (InterlockedCompareExchange(&g_watching, 1, 0) == 0)
-            if (HANDLE t = CreateThread(nullptr, 0, WatchNotchbar, nullptr, 0, nullptr)) CloseHandle(t);
+            if (HANDLE t = CreateThread(nullptr, 0, WatchPerch, nullptr, 0, nullptr)) CloseHandle(t);
         // AdviseVisualTreeChange replays the whole tree on the UI thread and waits for it: never call it here
         if (HANDLE t = CreateThread(nullptr, 0, Advise, diag.Detach(), 0, nullptr)) CloseHandle(t);
         return S_OK;

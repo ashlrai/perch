@@ -1,13 +1,13 @@
 using System.Runtime.InteropServices;
-using static NotchBar.W;
+using static Perch.W;
 
-namespace NotchBar;
+namespace Perch;
 
 /// One cheap sweep: TCP listener table + Toolhelp process snapshot + CPU/RAM counters.
 /// No process spawns, no WMI, near-zero steady-state allocation.
 static unsafe class Probe
 {
-    public readonly record struct Server(int Port, string Proc);
+    public readonly record struct Server(int Port, string Proc, uint Pid);
 
     public static readonly List<Server> Servers = new();
     public static int Shells, AgentProcs;
@@ -56,7 +56,7 @@ static unsafe class Probe
             "surreal", "air", "temporal", "lms");
         Add(Cat.System, "System", "Idle", "svchost", "lsass", "services", "wininit", "spoolsv", "MsMpEng", "Spotify",
             "steam", "Discord", "nvcontainer", "NVIDIA Web Helper", "OneDrive", "PhoneExperienceHost", "msedgewebview2");
-        Add(Cat.Nb, "nb");
+        Add(Cat.Nb, "perch");
         return d;
     }
 
@@ -234,7 +234,7 @@ static unsafe class Probe
                     : Lookup.TryGetValue(nm0, out var c0) ? c0 : Cat.Other;
             bool dev = cat == Cat.Runtime || cfg.Ports.Contains(port) || (DevPorts.Contains(port) && cat != Cat.System);
             if (!dev || (NoisePorts.Contains(port) && !cfg.Ports.Contains(port))) continue;
-            Servers.Add(new Server(port, nm0 == "wslrelay" ? "wsl" : nm0 == "com.docker.backend" ? "docker" : nm0));
+            Servers.Add(new Server(port, nm0 == "wslrelay" ? "wsl" : nm0 == "com.docker.backend" ? "docker" : nm0, pid));
         }
         Servers.Sort((a, b) => a.Port.CompareTo(b.Port));
     }

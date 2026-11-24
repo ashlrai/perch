@@ -1,7 +1,7 @@
 using System.Runtime.InteropServices;
-using static NotchBar.W;
+using static Perch.W;
 
-namespace NotchBar;
+namespace Perch;
 
 /// DirectWrite text drawn through a Direct2D DC render target straight into our 32bpp premultiplied DIBs.
 /// Sharper, properly hinted grayscale text than GDI+ (which also can't draw colour emoji). Each call binds
@@ -31,7 +31,7 @@ static unsafe class Dw
 
     public static void Init()
     {
-        if (Environment.GetEnvironmentVariable("NOTCHBAR_GDIPLUS_TEXT") == "1") return;
+        if (Environment.GetEnvironmentVariable("PERCH_GDIPLUS_TEXT") == "1") return;
         try
         {
             Guid iidDw = new("b859ee5a-d838-4b5b-a2e8-1adc7d93db48");

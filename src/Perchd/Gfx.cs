@@ -1,6 +1,6 @@
-using static NotchBar.W;
+using static Perch.W;
 
-namespace NotchBar;
+namespace Perch;
 
 /// Thin GDI+ wrapper drawing into a 32bpp premultiplied DIB that is handed to
 /// UpdateLayeredWindow. One brush, one pen, one path — reused for everything.
@@ -283,11 +283,12 @@ unsafe sealed class Gfx : IDisposable
         nint result = 0;
         if (PrintWindow(hwnd, wdc, 2) != 0)   // PW_RENDERFULLCONTENT: works for GPU-drawn apps too
         {
-            // crop: keep the top-left of the window (title, code) at the card's aspect ratio
+            // crop: keep the bottom-left of the window at the card's aspect ratio, where a terminal's
+            // newest output and an editor's terminal panel are
             float k = MathF.Max(w / (float)ww, h / (float)wh);
             int cw = (int)(w / k), ch = (int)(h / k);
             SetStretchBltMode(sdc, 4); SetBrushOrgEx(sdc, 0, 0, null);
-            StretchBlt(sdc, 0, 0, w, h, wdc, 0, 0, cw, ch, 0x00CC0020);
+            StretchBlt(sdc, 0, 0, w, h, wdc, 0, Math.Max(0, wh - ch), cw, ch, 0x00CC0020);
             GdiFlush();
             SelectObject(sdc, o2); o2 = 0;
             nint bmp;

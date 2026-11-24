@@ -1,9 +1,9 @@
 using System.Runtime.InteropServices;
 using System.Text;
 using Microsoft.Win32;
-using static NotchBar.W;
+using static Perch.W;
 
-namespace NotchBar;
+namespace Perch;
 
 /// The palette. One glass tone for every surface, hairline edges; colour means status, plus an accent for
 /// "running" and selection. Follows Windows' taskbar theme (light/dark) and accent colour unless the config says otherwise.
@@ -86,7 +86,7 @@ static class C
 }
 
 enum Ico { None, Spin, Pulse, Check, Cross, Dot }
-enum HK { None, Open, Close, Tab, Row, Server, Repo, Card, Chip, Focus, Allow, Deny, Rerun }
+enum HK { None, Open, Close, Tab, Row, Server, Repo, Card, Chip, Focus, Allow, Deny, Rerun, Reply, Always, Timed, Review, Undo, View, Fix, Stop, Restart, Link }
 struct Hit { public RectF R; public HK K; public string Arg; }
 
 /// What the collapsed notch says: an icon (or agent glyph), a title, a mono detail, docked agents.
@@ -145,7 +145,7 @@ static unsafe partial class App
         Model.Pin(_cfg.Repos);
         nint inst = GetModuleHandleW(0);
         _hand = LoadCursorW(0, 32649);
-        fixed (char* cls = "NotchBar")
+        fixed (char* cls = "Perch")
         {
             var wc = new WNDCLASSEXW
             {
@@ -396,7 +396,7 @@ static unsafe partial class App
     {
         if (Model.Now - _lastLog < 5000) return; // never spam the disk from a render loop
         _lastLog = Model.Now;
-        try { File.AppendAllText(Path.Combine(Path.GetTempPath(), "notchbar.log"), $"{DateTime.Now:s} {ex.GetType().Name}: {ex.Message}\n{ex.StackTrace}\n"); } catch { }
+        try { File.AppendAllText(Path.Combine(Path.GetTempPath(), "perch.log"), $"{DateTime.Now:s} {ex.GetType().Name}: {ex.Message}\n{ex.StackTrace}\n"); } catch { }
     }
 
     [UnmanagedCallersOnly]
@@ -538,7 +538,8 @@ static unsafe partial class App
             case 0x0205: ShowMenu(); return 0;
             case 0x020A: OnWheel(-(short)((w >> 16) & 0xFFFF), false); return 0;   // WM_MOUSEWHEEL: down = next
             case 0x020E: OnWheel((short)((w >> 16) & 0xFFFF), false); return 0;    // WM_MOUSEHWHEEL: swipe right = next
-            case 0x0100: OnKey((int)w); return 0;                                   // WM_KEYDOWN (we're foreground while open)
+            case 0x0100: if (!Composing) OnKey((int)w); return 0;                  // WM_KEYDOWN (we're foreground while open)
+            case 0x0102: if (OnChar((char)w)) return 0; break;                     // WM_CHAR: typing a quick reply
             case 0x0006: if ((w & 0xFFFF) == 0 && Expanded) Collapse(false); break; // WM_ACTIVATE: clicked elsewhere
             case 0x0020:                                                     // WM_SETCURSOR
                 if (_hk != HK.None) { SetCursor(_hand); return 1; }
@@ -552,7 +553,7 @@ static unsafe partial class App
                 break;
             case 0x0320: ThemeChanged(); return 0;                           // WM_DWMCOLORIZATIONCOLORCHANGED
             case WM_SOCK: OnSocket(); return 0;
-            case WM_GIT: Invalidate(); return 0;
+            case WM_GIT: OnWorkerDone(); return 0;
             case WM_LAYOUT: UpdatePlates(); Invalidate(); return 0;
             case WM_TICK: _tickPosted = false; PumpInput(); Frame(); return 0;
             case WM_PREVIEW: OnPreviews(); return 0;
@@ -616,8 +617,9 @@ static unsafe partial class App
         CheckFullscreen();
         UpdateTuck();
         ZAll();
-        if (Expanded) { RefreshGit(now); RefreshUsage(); }
-        else if (!_deckShown)
+        if (Expanded) { RefreshGit(now); RefreshUsage(); RefreshChanges(); if (_tab == 2) RefreshPorts(); }
+        RefreshCi(now);
+        if (!Expanded && !_deckShown)
         {   // hovered but never opened: drop the prefetched pictures
             if (_prev.Count > 0 && now - _prevAt > 10_000) FreePreviews(_prev);
             if (_scrimPre != 0 && _scrimBusy == 0 && now - _scrimPreAt > 8_000) { nint b = Interlocked.Exchange(ref _scrimPre, 0); if (b != 0) DeleteObject(b); }
@@ -742,13 +744,15 @@ static unsafe partial class App
     {
         const string RunKey = @"Software\Microsoft\Windows\CurrentVersion\Run";
         bool auto;
-        using (var k = Registry.CurrentUser.OpenSubKey(RunKey)) auto = k?.GetValue("notchbar") != null;
+        using (var k = Registry.CurrentUser.OpenSubKey(RunKey)) auto = k?.GetValue("perch") != null;
         nint m = CreatePopupMenu();
         AppendMenuW(m, auto ? 0x8u : 0, 1, "Start with Windows");
         AppendMenuW(m, 0, 2, "Edit config");
         AppendMenuW(m, 0, 3, "Reload config");
+        int rules = Model.RuleCount();
+        AppendMenuW(m, rules > 0 ? 0u : 0x1u, 4, rules > 0 ? $"Clear approval rules ({rules})" : "No approval rules");   // MF_GRAYED when none
         AppendMenuW(m, 0x800, 0, null);
-        AppendMenuW(m, 0, 9, "Quit notchbar");
+        AppendMenuW(m, 0, 9, "Quit perch");
         POINT p; GetCursorPos(&p);
         SetForegroundWindow(_hwnd);
         int cmd = TrackPopupMenu(m, 0x100 | 0x2 | 0x80, p.X, p.Y, 0, _hwnd, 0); // RETURNCMD | RIGHTBUTTON | NONOTIFY
@@ -757,21 +761,22 @@ static unsafe partial class App
         {
             case 1:
                 using (var k = Registry.CurrentUser.CreateSubKey(RunKey))
-                    if (auto) k.DeleteValue("notchbar", false); else k.SetValue("notchbar", $"\"{Environment.ProcessPath}\"");
+                    if (auto) k.DeleteValue("perch", false); else k.SetValue("perch", $"\"{Environment.ProcessPath}\"");
                 break;
             case 2: Config.EnsureFile(); ShellExecuteW(0, "open", "notepad.exe", $"\"{Config.FilePath}\"", null, 1); break;
             case 3:
                 _cfg = Config.Load(); Model.Pin(_cfg.Repos); RegisterHotkey(); ThemeChanged();
                 if (!_cfg.FollowMonitor && _monH != MonitorFromPoint(default, 1)) { _monH = MonitorFromPoint(default, 1); _cb0 = _cb1 = -1; Place(); TaskbarProbe.Refresh(_hwnd, WM_LAYOUT, Tray()); }
                 _tuckWant = false; CheckFullscreen(); UpdateTuck(); Poll(); break;
+            case 4: Model.ClearRules(); Model.Note = "Approval rules cleared"; Model.NoteAt = Model.Now; Invalidate(); break;
             case 9: DestroyWindow(_hwnd); break;
         }
     }
 
     // ================================================================ animation
 
-    static readonly bool Prof = Environment.GetEnvironmentVariable("NOTCHBAR_PROF") == "1";
-    static void P(string what, long t0) { if (Prof) try { File.AppendAllText(Path.Combine(Path.GetTempPath(), "notchbar-prof.txt"), $"{what} {(System.Diagnostics.Stopwatch.GetTimestamp() - t0) * 1000.0 / System.Diagnostics.Stopwatch.Frequency:0.00}ms" + Environment.NewLine); } catch { } }
+    static readonly bool Prof = Environment.GetEnvironmentVariable("PERCH_PROF") == "1";
+    static void P(string what, long t0) { if (Prof) try { File.AppendAllText(Path.Combine(Path.GetTempPath(), "perch-prof.txt"), $"{what} {(System.Diagnostics.Stopwatch.GetTimestamp() - t0) * 1000.0 / System.Diagnostics.Stopwatch.Frequency:0.00}ms" + Environment.NewLine); } catch { } }
 
     static void Expand()
     {
@@ -779,7 +784,7 @@ static unsafe partial class App
         long p0 = System.Diagnostics.Stopwatch.GetTimestamp();
         _prevFg = GetForegroundWindow();
         SortLists(); BuildTerms();
-        RefreshUsage();
+        RefreshUsage(); RefreshChanges(); RefreshPorts();
         // an agent is waiting for Allow / Deny: open straight onto its card
         for (int i = 0; i < _terms.Count && i < MaxCards; i++)
             if (_terms[i].AskPort > 0 && _terms[i].State == "wait" && _terms[i].Verdict.Length == 0) { _tab = 0; _tabPos = 0; _focus[0] = i; break; }
@@ -800,6 +805,7 @@ static unsafe partial class App
     {
         if (!Expanded) return;
         _viaHotkey = false;
+        _compose = null; _composeKey = "";
         _hits.Clear(); _hk = HK.None; _harg = null;
         _dhits.Clear(); _dhk = HK.None; _dharg = null;
         if (restoreFocus && GetForegroundWindow() == _hwnd && _prevFg != 0 && IsWindow(_prevFg) != 0) SetForegroundWindow(_prevFg);
@@ -1069,13 +1075,15 @@ static unsafe partial class App
         bool anim = hr - _aStart < _aDur || settling || deckMoving || flashing || dropping;
         bool live = (ca > 0 && (pill.Icon is Ico.Spin or Ico.Pulse || pill.HasProg && pill.Prog < 0)) || (ea > 0 && PanelLive());
         // open cards with a running clock (a build, a working agent) tick once a second
-        bool clocks = ea > 0 && _tTo > 0.5f && (_tab == 0 ? _terms.Exists(x => x.State == "busy") : _tab == 1 && _tasks.Exists(x => x.Running));
+        // ...and so does the Agents page, re-reading the focused terminal's text
+        bool clocks = ea > 0 && _tTo > 0.5f && (_tab == 0 ? _terms.Count > 0 : _tab == 1 && _tasks.Exists(x => x.Running));
+        if (clocks && _tab == 0 && hr - _termAt > 900) { _termAt = hr; RefreshTermText(true); }
         if (anim)
         {   // pace animation frames to the display: wait for the compositor, then draw the next one
             SetAnim(0);
             _wantTick = true;
         }
-        else SetAnim(live ? (_cfg.LowMotion ? 1000 : 50) : clocks ? 1000 : 0);
+        else SetAnim(live ? (_cfg.LowMotion ? 1000 : 50) : Composing && !_cfg.LowMotion ? 265 : clocks ? 1000 : 0);
     }
 
     // ---- hover: the notch lifts a little and reveals a second line (spring, slight overshoot)
@@ -1290,13 +1298,18 @@ static unsafe partial class App
             bool ok = fin.Code == 0;
             return new Pill { Dock = BuildDock(null), Icon = ok ? Ico.Check : Ico.Cross, IconColor = ok ? C.Ok : C.Err,
                 Title = ok ? fin.Label : fin.Label + " failed", Detail = ResultText(fin), HasProg = !ok, Prog = 1, Err = !ok,
-                Sub = ShortPath(fin.Cwd) + "  ·  " + (ok ? "passed in " + Fmt.Dur(fin.End - fin.Start) : "click to see it, Enter to run again") };
+                Sub = ShortPath(fin.Cwd) + "  ·  " + (Streak(fin.Job) is var (sn, sok) && sn >= 2 ? (sok ? $"passed {sn} times in a row" : $"failed {sn} times in a row")
+                      : ok ? "passed in " + Fmt.Dur(fin.End - fin.Start) : "open the cards to see why") };
         }
         if (done != null && now - done.Since < 8_000)
             return new Pill { Dock = BuildDock(done), Icon = Ico.Check, IconColor = C.Ok, Agent = done.Name, Title = done.Name + " finished", Detail = Fmt.Dir(done.Cwd),
                 Sub = Quote(done.Prompt) };
         if (now - Model.NoteAt < 6_000 && Model.Note.Length > 0)
             return new Pill { Icon = Ico.Dot, IconColor = C.Text, Title = Model.Note, Detail = "" };
+        int nBusy = Model.Agents.Count(a => a.State == "busy");
+        if (busy != null && nBusy >= 2)   // several agents at once: a summary, each one's step on hover
+            return new Pill { Dock = BuildDock(busy), Icon = Ico.Spin, IconColor = C.Run, Agent = busy.Name, Title = $"{nBusy} agents working", Detail = Doing(busy),
+                Sub = string.Join("  ·  ", Model.Agents.Where(a => a.State == "busy").Take(3).Select(a => Fmt.Dir(a.Cwd) + ": " + Doing(a))) };
         if (busy != null)
             return new Pill { Dock = BuildDock(busy), Icon = Ico.Spin, IconColor = C.Run, Agent = busy.Name, Title = Doing(busy), Detail = Fmt.Clock(now - busy.Since),
                 Sub = Quote(busy.Prompt) is { Length: > 0 } q ? q : AgentTitle(busy.Name) + " in " + Fmt.Dir(busy.Cwd) };
@@ -1312,6 +1325,21 @@ static unsafe partial class App
             return new Pill { Icon = Ico.Dot, IconColor = C.Ok, Title = ports, Detail = Probe.Servers[0].Proc,
                 Sub = string.Join("  ", Probe.Servers.Take(5).Select(s => ":" + s.Port + " " + s.Proc)) };
         return new Pill { Icon = Ico.Dot, IconColor = C.Faint, Title = "All quiet", Detail = "", Sub = HotkeyHint("agents, builds, ports, git") };
+    }
+
+    /// How many of a command's latest runs in a row had the same result as the last one (for `perch watch` above all).
+    static (int N, bool Ok) Streak(string job)
+    {
+        var runs = Model.Runs;
+        int n = 0; bool? ok = null;
+        for (int i = runs.Count - 1; i >= 0; i--)
+        {
+            if (runs[i].Job != job) continue;
+            bool r = runs[i].Code == 0;
+            if (ok == null) ok = r; else if (ok != r) break;
+            n++;
+        }
+        return (n, ok ?? true);
     }
 
     static string Quote(string prompt) => prompt.Length == 0 ? "" : "“" + (prompt.Length > 90 ? prompt[..89] + "…" : prompt) + "”";
@@ -1487,6 +1515,7 @@ static unsafe partial class App
         t = Math.Clamp(t, 0, Tabs - 1);
         if (t == _tab) return;
         _tab = t;
+        _compose = null; _composeKey = ""; _confirm = ""; if (t == 2) RefreshPorts(); if (t == 3) RefreshCi(Model.Now);
         _hk = HK.None; _harg = null; _dhk = HK.None; _dharg = null;
         _fpos = _focus[t]; _enterAt = Hr;
         Invalidate();
@@ -1503,12 +1532,65 @@ static unsafe partial class App
         static int Rank(AgentInfo a) => a.State switch { "wait" => 0, "busy" => 1, _ => 2 };
     }
 
+    static long _termAt;
+
+    /// Live terminal text for the agent cards: the focused card's window (or every agent window).
+    static void RefreshTermText(bool focusedOnly)
+    {
+        var hw = new List<nint>();
+        for (int i = 0; i < _terms.Count && i < MaxCards; i++)
+        {
+            if (focusedOnly && i != _focus[0]) continue;
+            if (_prev.TryGetValue(_terms[i].Key, out var pv) && pv.Hwnd != 0) hw.Add(pv.Hwnd);
+        }
+        TermText.Refresh(hw, _hwnd, WM_GIT);
+    }
+
     /// Context meter: re-read the sessions' transcripts while the cards are open or about to be
     /// (each read parses only the lines added since the last one).
     static void RefreshUsage()
     {
         foreach (var a in Model.Agents)
             if (a.Transcript.Length > 0) Usage.Refresh(a.Transcript, _hwnd, WM_GIT);
+        Usage.RefreshTotals(_hwnd, WM_GIT);
+    }
+
+    /// "What changed": diff stats for agents that finished a turn in which they edited files.
+    static void RefreshChanges()
+    {
+        foreach (var a in Model.Agents)
+            if (a.State == "done" && a.Touched.Count > 0 && a.ChangesFor != a.Since) Git.Changes(a, _hwnd, WM_GIT);
+    }
+
+    static void RefreshPorts()
+    {
+        var pids = new List<uint>();
+        foreach (var s in Probe.Servers) if (s.Pid > 4) pids.Add(s.Pid);
+        ProcInfo.Refresh(pids, _hwnd, WM_GIT);
+    }
+
+    /// CI and pull requests through `gh`: every 30 s for the Git page while it's open, and every 90 s in the
+    /// background for repos used in the last two hours (so a failing run on something you just pushed shows up).
+    static void RefreshCi(long now)
+    {
+        foreach (var r in Model.Repos)
+        {
+            bool open = Expanded && _tab == 3, recent = r.Used > 1 && now - r.Used < 2 * 3600_000;
+            if (!open && !recent) continue;
+            if (now - r.GhLast > (open ? 30_000 : 90_000)) Git.RefreshGh(r, _hwnd, WM_GIT);
+        }
+    }
+
+    static void OnWorkerDone()
+    {
+        if (Git.TakeCiFailure() is { } r)
+        {
+            string wf = r.Gh?.RunName is { Length: > 0 } n ? n : "CI";
+            Model.Note = $"{wf} failed on {r.Name}"; Model.NoteAt = Model.Now;
+            _flashAt = Hr; _flashCol = C.Err;
+            if (_cfg.Sound && !_hidden) PlaySoundW("SystemHand", 0, 0x10000 | 0x1 | 0x2 | 0x10);
+        }
+        Invalidate();
     }
 
     static void RefreshGit(long now)
@@ -1544,6 +1626,7 @@ static unsafe partial class App
         public string Name, Host, Cwd, State, Prompt, Tool, Msg, Key, Verdict, Transcript;
         public long Since, PromptAt; public bool Hooked; public List<LogEntry>? Log;
         public uint Pid; public int AskPort;
+        public int AutoN, TouchedN; public List<(string Path, int Add, int Del)>? Changes;
     }
     static readonly List<Term> _terms = new();
 
@@ -1564,7 +1647,8 @@ static unsafe partial class App
             if (m >= 0) { used[m] = true; if (host.Length == 0) host = procs[m].Host; if (pid == 0) pid = procs[m].Pid; }
             _terms.Add(new Term { Name = a.Name, Host = host.Length > 0 ? host : "Terminal", Cwd = a.Cwd, State = a.State, Prompt = a.Prompt,
                 Tool = a.Tool, Msg = a.Msg, Key = a.Key, Since = a.Since, PromptAt = a.PromptAt, Hooked = true, Log = a.Log,
-                Pid = pid, AskPort = a.AskPort, Verdict = a.Verdict, Transcript = a.Transcript });
+                Pid = pid, AskPort = a.AskPort, Verdict = a.Verdict, Transcript = a.Transcript,
+                AutoN = a.AutoN, TouchedN = a.Touched.Count, Changes = a.Changes });
         }
         for (int i = 0; i < procs.Count; i++)
             if (!used[i])

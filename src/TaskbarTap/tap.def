@@ -1,4 +1,4 @@
-LIBRARY notchbar-tap
+LIBRARY perch-tap
 EXPORTS
     DllGetClassObject PRIVATE
     DllCanUnloadNow PRIVATE
