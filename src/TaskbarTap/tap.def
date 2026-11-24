@@ -1,0 +1,4 @@
+LIBRARY notchbar-tap
+EXPORTS
+    DllGetClassObject PRIVATE
+    DllCanUnloadNow PRIVATE
