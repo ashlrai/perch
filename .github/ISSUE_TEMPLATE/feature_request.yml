@@ -1,0 +1,16 @@
+name: Feature request
+description: An idea for perch
+labels: [enhancement]
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: What would it help with
+      description: The situation you're in and what's missing. A real example is best.
+    validations:
+      required: true
+  - type: textarea
+    id: idea
+    attributes:
+      label: What you have in mind
+      description: How it could look or work. Rough is fine.

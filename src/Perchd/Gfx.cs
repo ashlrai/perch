@@ -268,39 +268,6 @@ unsafe sealed class Gfx : IDisposable
         return result;
     }
 
-    /// Picture of a window (even when covered) shrunk to w x h pixels, cropped to fill. 0 if it can't
-    /// be captured (minimized, gone). Worker-thread safe.
-    public static nint CaptureWindow(nint hwnd, int w, int h)
-    {
-        RECT r;
-        if (IsIconic(hwnd) != 0 || GetWindowRect(hwnd, &r) == 0) return 0;
-        int ww = r.R - r.L, wh = r.B - r.T;
-        if (ww < 50 || wh < 50 || w < 4 || h < 4) return 0;
-        nint scr = GetDC(0);
-        nint wdc = CreateCompatibleDC(scr), sdc = CreateCompatibleDC(scr);
-        nint wbm = CreateCompatibleBitmap(scr, ww, wh), sbm = CreateCompatibleBitmap(scr, w, h);
-        nint o1 = SelectObject(wdc, wbm), o2 = SelectObject(sdc, sbm);
-        nint result = 0;
-        if (PrintWindow(hwnd, wdc, 2) != 0)   // PW_RENDERFULLCONTENT: works for GPU-drawn apps too
-        {
-            // crop: keep the bottom-left of the window at the card's aspect ratio, where a terminal's
-            // newest output and an editor's terminal panel are
-            float k = MathF.Max(w / (float)ww, h / (float)wh);
-            int cw = (int)(w / k), ch = (int)(h / k);
-            SetStretchBltMode(sdc, 4); SetBrushOrgEx(sdc, 0, 0, null);
-            StretchBlt(sdc, 0, 0, w, h, wdc, 0, Math.Max(0, wh - ch), cw, ch, 0x00CC0020);
-            GdiFlush();
-            SelectObject(sdc, o2); o2 = 0;
-            nint bmp;
-            if (GdipCreateBitmapFromHBITMAP(sbm, 0, &bmp) == 0) result = bmp;
-        }
-        if (o2 != 0) SelectObject(sdc, o2);
-        SelectObject(wdc, o1);
-        DeleteObject(wbm); DeleteObject(sbm); DeleteDC(wdc); DeleteDC(sdc);
-        ReleaseDC(0, scr);
-        return result;
-    }
-
     /// Blurred snapshot of a screen rectangle as a GDI+ bitmap (0 on failure). Touches no shared
     /// state, so it can run on a worker thread.
     public static nint Snapshot(int sx, int sy, int w, int h)

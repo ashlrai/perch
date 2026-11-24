@@ -247,18 +247,32 @@ static class Cli
             return;
         }
 
-        // Ask on the notch: report a reply port, wait for "allow"/"deny", answer the hook with it.
+        // Ask on the notch: report a reply port and a one-time token, wait for "allow:<token>" / "deny:<token>",
+        // answer the hook with it. The token means only the notch we told can answer: another program on this
+        // PC that finds the port can't approve anything.
         using var s = new Socket(AddressFamily.InterNetwork, SocketType.Dgram, ProtocolType.Udp);
         s.Bind(new IPEndPoint(IPAddress.Loopback, 0));
         int port = ((IPEndPoint)s.LocalEndPoint!).Port;
-        Send("A", key, "wait", name, cwd, "", msg, "", "", host, pid, port.ToString(), transcript);
+        string token = Convert.ToHexString(System.Security.Cryptography.RandomNumberGenerator.GetBytes(16));
+        Send("A", key, "wait", name, cwd, "", msg, "", "", host, pid, port.ToString(), transcript, token);
         string answer = "";
+        var deadline = Environment.TickCount64 + AskSeconds * 1000;
         try
         {
-            var buf = new byte[64];
-            s.ReceiveTimeout = AskSeconds * 1000;
-            int n = s.Receive(buf);
-            answer = Encoding.ASCII.GetString(buf, 0, n);
+            var buf = new byte[128];
+            while (answer.Length == 0)
+            {
+                long left = deadline - Environment.TickCount64;
+                if (left <= 0) break;
+                s.ReceiveTimeout = (int)left;
+                EndPoint from = new IPEndPoint(IPAddress.Any, 0);
+                int n = s.ReceiveFrom(buf, ref from);
+                if (from is not IPEndPoint { Address: var addr } || !IPAddress.IsLoopback(addr)) continue;
+                string m = Encoding.ASCII.GetString(buf, 0, n);
+                if (m == "allow:" + token) answer = "allow";
+                else if (m == "deny:" + token) answer = "deny";
+                // anything else (a wrong or missing token) is ignored, and we keep waiting
+            }
         }
         catch { }   // timed out: leave it to Claude's own prompt
         if (answer is "allow" or "deny")
@@ -305,42 +319,6 @@ static class Cli
     [System.Runtime.InteropServices.DllImport("kernel32.dll")] static extern unsafe int Process32FirstW(nint snap, PE* e);
     [System.Runtime.InteropServices.DllImport("kernel32.dll")] static extern unsafe int Process32NextW(nint snap, PE* e);
     [System.Runtime.InteropServices.DllImport("kernel32.dll")] static extern int CloseHandle(nint h);
-
-    /// Approval rules made from the notch, shared through %APPDATA%\perch\rules.tsv:
-    /// expiresUtcMs (0 = never) \t folder \t tool \t command prefix (Bash only; empty = any).
-    static class Rules
-    {
-        public static bool Allows(string cwd, string tool, string detail)
-        {
-            try
-            {
-                string path = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData), "perch", "rules.tsv");
-                if (tool.Length == 0 || !File.Exists(path)) return false;
-                string root = Root(cwd);
-                long now = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
-                string cmd = detail.Trim();
-                foreach (var line in File.ReadAllLines(path))
-                {
-                    var p = line.Split('\t');
-                    if (p.Length < 4 || !long.TryParse(p[0], out var exp) || (exp != 0 && exp < now)) continue;
-                    if (!string.Equals(p[1], root, StringComparison.OrdinalIgnoreCase) || p[2] != tool) continue;
-                    if (p[3].Length == 0) return true;
-                    // a command prefix matches whole words only, and never a chained command (&&, |, ;, ...)
-                    if (cmd.IndexOfAny(['&', '|', ';', '>', '<', '`', '\n']) >= 0 || cmd.Contains("$(")) continue;
-                    if (cmd == p[3] || cmd.StartsWith(p[3] + " ", StringComparison.Ordinal)) return true;
-                }
-            }
-            catch { }
-            return false;
-        }
-
-        /// The repository a folder is in (or the folder itself).
-        public static string Root(string cwd)
-        {
-            try { for (string? d = cwd; d != null; d = Path.GetDirectoryName(d)) if (Path.Exists(Path.Combine(d, ".git"))) return d; } catch { }
-            return cwd;
-        }
-    }
 
     static string Clip(string s, int n) => s.Length <= n ? s : s[..(n - 1)] + "…";   // keep the datagram small
 

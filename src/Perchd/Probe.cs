@@ -76,6 +76,17 @@ static unsafe class Probe
         Sample();
     }
 
+    public enum Kind { Other, Shell, Host, Agent }
+
+    /// What a process is, by its exe name (worker-thread safe): a shell, a terminal/editor, an agent CLI, or other.
+    /// explorer counts as other: it owns windows, but never the one an agent runs in.
+    public static Kind KindOf(uint pid)
+    {
+        string n = NameOf(pid);
+        if (n == "explorer" || !Cats.TryGetValue(n, out var c)) return Kind.Other;
+        return c switch { Cat.Shell => Kind.Shell, Cat.Host => Kind.Host, Cat.Agent => Kind.Agent, _ => Kind.Other };
+    }
+
     static string NameOf(uint pid)
     {
         if (pid == 4) return "System";
@@ -145,21 +156,22 @@ static unsafe class Probe
         }
         Active = active;
 
-        int shells = 0, agents = 0;
+        int shells = 0;
         foreach (var (_, p) in _procs)
-        {
             if (p.Cat == Cat.Shell && _procs.TryGetValue(p.Parent, out var par) && par.Cat == Cat.Host) shells++;
-            else if (p.Cat == Cat.Agent && !(_procs.TryGetValue(p.Parent, out var ap) && ap.Cat == Cat.Agent)) agents++;
+        // only agents running in a terminal or editor count: the same CLI started in the background by a browser
+        // (e.g. Claude's Chrome extension bridge), an app or a script is not a session you're working in
+        AgentNames.Clear(); Agents.Clear();
+        foreach (var (pid, canon) in _agentCanon)
+        {
+            if (_procs.TryGetValue(_procs[pid].Parent, out var pp) && pp.Cat == Cat.Agent) continue;   // a child of another agent
+            if (HostOf(pid) is not { } host) continue;
+            Agents.Add((canon, host, pid));
+            if (!AgentNames.Contains(canon)) AgentNames.Add(canon);
         }
-        AgentNames.Clear();
-        foreach (var (pid, canon) in _agentCanon)
-            if (!(_procs.TryGetValue(_procs[pid].Parent, out var pp) && pp.Cat == Cat.Agent) && !AgentNames.Contains(canon)) AgentNames.Add(canon);
         AgentNames.Sort(StringComparer.Ordinal);
-        Agents.Clear();
-        foreach (var (pid, canon) in _agentCanon)
-            if (!(_procs.TryGetValue(_procs[pid].Parent, out var pp) && pp.Cat == Cat.Agent)) Agents.Add((canon, HostOf(pid), pid));
         Agents.Sort((a, b) => string.CompareOrdinal(a.Name, b.Name));
-        Shells = shells; AgentProcs = agents;
+        Shells = shells; AgentProcs = Agents.Count;
 
         BuildServers(cfg, _procs);
         Sample();
@@ -179,16 +191,26 @@ static unsafe class Probe
         return d;
     }
 
-    /// Walk up the parent chain to the first editor/terminal process.
-    static string HostOf(uint pid)
+    /// The terminal or editor an agent runs in: walk up past shells to the first editor/terminal process.
+    /// null when something else started it (a browser, an app, a script): then it isn't an interactive session.
+    static string? HostOf(uint pid)
     {
+        uint self = pid;
         for (int i = 0; i < 16 && _procs.TryGetValue(pid, out var p); i++)
         {
-            if (p.Cat == Cat.Host && _hostCanon.TryGetValue(pid, out var h) && h is not ("OpenConsole" or "explorer")) return HostName(h);
+            if (pid != self)
+            {
+                if (p.Cat == Cat.Host && _hostCanon.TryGetValue(pid, out var h))
+                {
+                    if (h == "explorer") return "Console";   // a shell opened straight from Start/Explorer: a classic console window
+                    if (h != "OpenConsole") return HostName(h);
+                }
+                else if (p.Cat is not (Cat.Shell or Cat.Nb)) return null;   // started by something that isn't a terminal
+            }
             if (p.Parent == pid || p.Parent == 0) break;
             pid = p.Parent;
         }
-        return "Terminal";
+        return "Terminal";   // the chain ends in a parent that has exited (e.g. a terminal restarted): give it the benefit of the doubt
     }
 
     static string HostName(string exe) => exe switch

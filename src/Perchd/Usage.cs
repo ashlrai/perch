@@ -53,6 +53,9 @@ static class Usage
         }, null);
     }
 
+    /// Parse a whole transcript at once (for tests).
+    internal static Snap? ReadOnce(string path) { var t = new Track { Path = path }; Read(t); return t.Snap; }
+
     static bool Read(Track t)
     {
         using var fs = new FileStream(t.Path, FileMode.Open, FileAccess.Read, FileShare.ReadWrite | FileShare.Delete);
@@ -141,7 +144,10 @@ static class Usage
                                     if (k is "file_path" or "notebook_path" or "path") what = System.IO.Path.GetFileName(what.TrimEnd('\\', '/'));
                                     break;
                                 }
-                        Add(t, new Ev { T = ts, Kind = 't', Text = (name + "  " + what.ReplaceLineEndings(" ")).Trim(), Id = c.TryGetProperty("id", out var id) ? id.GetString() ?? "" : "", Ctx = t.Context });
+                        string tid = c.TryGetProperty("id", out var id) ? id.GetString() ?? "" : "";
+                        // the same call written again (e.g. a resumed session replaying history): keep one
+                        if (tid.Length > 0 && t.Events.Count > 0 && t.Events.FindLastIndex(t.Events.Count - 1, Math.Min(t.Events.Count, 80), e => e.Id == tid) >= 0) continue;
+                        Add(t, new Ev { T = ts, Kind = 't', Text = (name + "  " + what.ReplaceLineEndings(" ")).Trim(), Id = tid, Ctx = t.Context });
                     }
                     else if (ct == "text" && c.TryGetProperty("text", out var tx) && (tx.GetString() ?? "").Trim() is { Length: > 0 } s)
                         Add(t, new Ev { T = ts, Kind = 'r', Text = s.ReplaceLineEndings(" "), Ctx = t.Context, Dur = 0 });

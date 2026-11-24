@@ -22,6 +22,7 @@ sealed class AgentInfo
     public long PromptAt;
     public uint Pid;                                      // the agent process (its window is found from it)
     public int AskPort;                                   // > 0: a PermissionRequest hook is waiting for Allow/Deny here
+    public string AskToken = "";                          // ...and only accepts an answer carrying this one-time token
     public string Verdict = "";                           // "allow" / "deny" when answered from the notch
     public readonly List<LogEntry> Log = new();          // tool calls since the last prompt
     public long Since, Updated;
@@ -174,7 +175,7 @@ static class Model
         // a waiting PermissionRequest hook keeps its Allow/Deny through Claude's own "needs permission"
         // notification; any other event (or perch giving up, port -1) ends the question
         int port = f.Length > 12 && int.TryParse(f[12], out var pp) ? pp : 0;
-        if (port != 0 || st != "wait") a.AskPort = Math.Max(0, port);
+        if (port != 0 || st != "wait") { a.AskPort = Math.Max(0, port); a.AskToken = port > 0 && f.Length > 14 ? f[14] : ""; }
         Touch(f[5], now);
         while (Agents.Count > 6)
         {
@@ -291,9 +292,9 @@ static class Model
     }
 
     // ---------------------------------------------------------------- approval rules
-    // Read by `perch agent` on every PermissionRequest (same file format; see perch's Rules class).
+    // Read by `perch agent` on every PermissionRequest; format and matching in Shared/Rules.cs.
 
-    static string RulesPath => Path.Combine(Config.Dir, "rules.tsv");
+    static string RulesPath => Rules.FilePath;
 
     /// Allow `tool` in the repository of `cwd` (Bash: commands starting with `prefix`), forever or for `minutes`.
     public static void AddRule(string cwd, string tool, string prefix, int minutes)
@@ -301,9 +302,7 @@ static class Model
         try
         {
             Directory.CreateDirectory(Config.Dir);
-            long exp = minutes > 0 ? DateTimeOffset.UtcNow.ToUnixTimeMilliseconds() + minutes * 60_000L : 0;
-            string root = FindRoot(cwd) ?? cwd;
-            File.AppendAllText(RulesPath, $"{exp}\t{root}\t{tool}\t{prefix.Replace('\t', ' ')}\n");
+            File.AppendAllText(RulesPath, Rules.Line(Rules.Root(cwd), tool, prefix, minutes, DateTimeOffset.UtcNow.ToUnixTimeMilliseconds()) + "\n");
         }
         catch { }
     }
@@ -321,18 +320,7 @@ static class Model
 
     public static void ClearRules() { try { File.Delete(RulesPath); } catch { } }
 
-    /// The command prefix an "Always" rule would use: the first two words, never past a chaining operator.
-    public static string RulePrefix(string command)
-    {
-        var words = command.Trim().Split(' ', StringSplitOptions.RemoveEmptyEntries);
-        var take = new List<string>();
-        foreach (var w in words)
-        {
-            if (take.Count == 2 || w.IndexOfAny(['&', '|', ';', '>', '<', '`']) >= 0 || w.StartsWith('-')) break;
-            take.Add(w);
-        }
-        return string.Join(' ', take);
-    }
+    public static string RulePrefix(string command) => Rules.Prefix(command);
 
     // ---------------------------------------------------------------- repos
 
@@ -589,12 +577,30 @@ sealed class Config
 {
     public readonly List<string> Repos = new();
     public readonly HashSet<int> Ports = new();
-    public bool HideFullscreen = true, LowMotion, Terrain, Glass, ClearTaskbar = true, Sound = true, FollowMonitor = true, TuckMaximized = true;
+    public bool HideFullscreen = true, LowMotion, Terrain, Glass, ClearTaskbar, Sound = true, FollowMonitor = true, TuckMaximized = true;
     public string Hotkey = "win+alt+n", Theme = "auto", Accent = "auto";
     public long ContextWindow;   // 0: from the model
 
     public static string Dir => Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData), "perch");
     public static string FilePath => Path.Combine(Dir, "config.ini");
+
+    /// Set one key in config.ini: replace its line, or add it (creating the file from the template).
+    public static void Set(string key, string value)
+    {
+        try
+        {
+            EnsureFile();
+            var lines = File.ReadAllLines(FilePath).ToList();
+            int i = lines.FindIndex(l => l.TrimStart().StartsWith(key, StringComparison.OrdinalIgnoreCase) && l.Contains('=')
+                                         && l[..l.IndexOf('=')].Trim().Equals(key, StringComparison.OrdinalIgnoreCase));
+            if (i >= 0) lines[i] = key + " = " + value; else lines.Add(key + " = " + value);
+            File.WriteAllLines(FilePath, lines);
+        }
+        catch { }
+    }
+
+    /// Windows 11's taskbar (build 22000+): the only one the taskbar probe and the Explorer helper understand.
+    public static bool Win11 => Environment.OSVersion.Version.Build >= 22000;
 
     public static Config Load()
     {
@@ -615,7 +621,7 @@ sealed class Config
                     case "port": if (int.TryParse(v, out var p)) c.Ports.Add(p); break;
                     case "hide_fullscreen": c.HideFullscreen = v is "1" or "true" or "yes" or "on"; break;
                     case "motion": c.LowMotion = v == "low"; break;
-                    case "taskbar": c.ClearTaskbar = v != "system"; break;
+                    case "taskbar": c.ClearTaskbar = v == "clear"; break;
                     case "backdrop": c.Terrain = v == "terrain"; c.Glass = v is "glass" or "blur"; break;
                     case "sound": c.Sound = v is "1" or "true" or "yes" or "on"; break;
                     case "hotkey": c.Hotkey = v.ToLowerInvariant(); break;
@@ -654,10 +660,11 @@ sealed class Config
             # motion = full | low    (low: static icons, 1 fps refresh while busy)
             motion = full
 
-            # taskbar = clear | system
-            #   clear: hide the Windows taskbar's own background so perch's glass boxes show through
-            #   (restored when perch quits; needs a restart of perch to change)
-            taskbar = clear
+            # taskbar = system | clear     (also: right-click the notch > Clear the taskbar background)
+            #   clear: hide the Windows 11 taskbar's own background so perch's glass boxes show through.
+            #   This loads a small helper into Explorer (like TranslucentTB does); it puts the background
+            #   back when perch quits. Changing it restarts perch.
+            taskbar = system
 
             # backdrop = plain | glass
             #   plain: the desktop is just dimmed behind the cards    glass: dimmed and blurred

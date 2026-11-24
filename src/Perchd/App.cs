@@ -178,7 +178,7 @@ static unsafe partial class App
         SetPoll(4000);
         SetTimer(_hwnd, T_TB, 15000, 0);   // backstop only (pin changes); events drive the rest
         fixed (char* n = "TaskbarCreated") _tbCreated = RegisterWindowMessageW(n);   // sent when Explorer (re)starts
-        if (_cfg.ClearTaskbar) TaskbarClear.Launch();
+        if (_cfg.ClearTaskbar && Config.Win11) TaskbarClear.Launch();
 
         MSG m;
         while (GetMessageW(&m, 0, 0, 0) > 0) { TranslateMessage(&m); DispatchMessageW(&m); }
@@ -274,11 +274,19 @@ static unsafe partial class App
     {
         UnregisterHotKey(_hwnd, HOTKEY_ID);
         if (ParseHotkey(_cfg.Hotkey, out uint mods, out uint vk) && RegisterHotKey(_hwnd, HOTKEY_ID, mods | 0x4000, vk) == 0)   // MOD_NOREPEAT
-            Log(new Exception($"hotkey '{_cfg.Hotkey}' is taken by another app"));
+        {   // another app owns it: say so in the notch (for longer than a normal note), and how to change it
+            string keys = string.Join("+", _cfg.Hotkey.Split('+', StringSplitOptions.TrimEntries | StringSplitOptions.RemoveEmptyEntries).Select(Cap));
+            Model.Note = $"{keys} is taken by another app · set hotkey = … in the config";
+            Model.NoteAt = Model.Now + 6_000;
+        }
+        else if (!ParseHotkey(_cfg.Hotkey, out _, out _) && _cfg.Hotkey is not ("" or "off" or "none"))
+        {
+            Model.Note = $"Can't read hotkey = {_cfg.Hotkey} · try e.g. win+alt+n"; Model.NoteAt = Model.Now + 6_000;
+        }
     }
 
     /// "win+alt+n", "ctrl+shift+f9", "ctrl+alt+space" -> MOD_* flags and a virtual-key code.
-    static bool ParseHotkey(string s, out uint mods, out uint vk)
+    internal static bool ParseHotkey(string s, out uint mods, out uint vk)
     {
         mods = 0; vk = 0;
         if (s is "" or "off" or "none") return false;
@@ -520,7 +528,7 @@ static unsafe partial class App
         if (h != _hwnd && _hwnd != 0) return DefWindowProcW(h, m, w, l);   // side boxes: nothing to handle
         if (m == _tbCreated && _tbCreated != 0)
         {   // Explorer restarted: a new taskbar, with its background back. Clear it once it has settled.
-            if (_cfg.ClearTaskbar) SetTimer(_hwnd, T_CLEAR, 2500, 0);
+            if (_cfg.ClearTaskbar && Config.Win11) SetTimer(_hwnd, T_CLEAR, 2500, 0);
             LayoutSoon();
             return 0;
         }
@@ -749,6 +757,7 @@ static unsafe partial class App
         AppendMenuW(m, auto ? 0x8u : 0, 1, "Start with Windows");
         AppendMenuW(m, 0, 2, "Edit config");
         AppendMenuW(m, 0, 3, "Reload config");
+        if (Config.Win11) AppendMenuW(m, _cfg.ClearTaskbar ? 0x8u : 0, 5, "Clear the taskbar background");
         int rules = Model.RuleCount();
         AppendMenuW(m, rules > 0 ? 0u : 0x1u, 4, rules > 0 ? $"Clear approval rules ({rules})" : "No approval rules");   // MF_GRAYED when none
         AppendMenuW(m, 0x800, 0, null);
@@ -768,6 +777,12 @@ static unsafe partial class App
                 _cfg = Config.Load(); Model.Pin(_cfg.Repos); RegisterHotkey(); ThemeChanged();
                 if (!_cfg.FollowMonitor && _monH != MonitorFromPoint(default, 1)) { _monH = MonitorFromPoint(default, 1); _cb0 = _cb1 = -1; Place(); TaskbarProbe.Refresh(_hwnd, WM_LAYOUT, Tray()); }
                 _tuckWant = false; CheckFullscreen(); UpdateTuck(); Poll(); break;
+            case 5:
+                // the Explorer helper is loaded (or its restore armed) at startup: save the choice and restart
+                Config.Set("taskbar", _cfg.ClearTaskbar ? "system" : "clear");
+                if (Environment.ProcessPath is { } self) ShellExecuteW(0, null, self, $"--after {Environment.ProcessId}", null, 0);
+                DestroyWindow(_hwnd);
+                break;
             case 4: Model.ClearRules(); Model.Note = "Approval rules cleared"; Model.NoteAt = Model.Now; Invalidate(); break;
             case 9: DestroyWindow(_hwnd); break;
         }
@@ -1075,9 +1090,7 @@ static unsafe partial class App
         bool anim = hr - _aStart < _aDur || settling || deckMoving || flashing || dropping;
         bool live = (ca > 0 && (pill.Icon is Ico.Spin or Ico.Pulse || pill.HasProg && pill.Prog < 0)) || (ea > 0 && PanelLive());
         // open cards with a running clock (a build, a working agent) tick once a second
-        // ...and so does the Agents page, re-reading the focused terminal's text
-        bool clocks = ea > 0 && _tTo > 0.5f && (_tab == 0 ? _terms.Count > 0 : _tab == 1 && _tasks.Exists(x => x.Running));
-        if (clocks && _tab == 0 && hr - _termAt > 900) { _termAt = hr; RefreshTermText(true); }
+        bool clocks = ea > 0 && _tTo > 0.5f && (_tab == 0 ? _terms.Exists(x => x.State is "busy" or "wait") : _tab == 1 && _tasks.Exists(x => x.Running));
         if (anim)
         {   // pace animation frames to the display: wait for the compositor, then draw the next one
             SetAnim(0);
@@ -1328,7 +1341,7 @@ static unsafe partial class App
     }
 
     /// How many of a command's latest runs in a row had the same result as the last one (for `perch watch` above all).
-    static (int N, bool Ok) Streak(string job)
+    internal static (int N, bool Ok) Streak(string job)
     {
         var runs = Model.Runs;
         int n = 0; bool? ok = null;
@@ -1530,20 +1543,6 @@ static unsafe partial class App
         _repos.Clear(); _repos.AddRange(Model.Repos);
         _repos.Sort((a, b) => b.Used.CompareTo(a.Used));
         static int Rank(AgentInfo a) => a.State switch { "wait" => 0, "busy" => 1, _ => 2 };
-    }
-
-    static long _termAt;
-
-    /// Live terminal text for the agent cards: the focused card's window (or every agent window).
-    static void RefreshTermText(bool focusedOnly)
-    {
-        var hw = new List<nint>();
-        for (int i = 0; i < _terms.Count && i < MaxCards; i++)
-        {
-            if (focusedOnly && i != _focus[0]) continue;
-            if (_prev.TryGetValue(_terms[i].Key, out var pv) && pv.Hwnd != 0) hw.Add(pv.Hwnd);
-        }
-        TermText.Refresh(hw, _hwnd, WM_GIT);
     }
 
     /// Context meter: re-read the sessions' transcripts while the cards are open or about to be

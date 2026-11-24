@@ -1,0 +1,51 @@
+# Builds and tests perch on every push and pull request. A version tag (v0.1.0, ...) also publishes a release
+# with perch-win-x64.zip, which get.ps1 installs.
+name: build
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  pull_request:
+
+permissions:
+  contents: write   # to publish releases from tags
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '9.0.x'
+
+      - name: Test
+        run: dotnet test tests/Perch.Tests -c Release --nologo
+
+      - name: Build perchd.exe, perch.exe and perch-tap.dll
+        shell: pwsh
+        run: |
+          # the Native AOT linker and the taskbar helper find MSVC through vswhere
+          $env:PATH += ";${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer"
+          $out = Join-Path $PWD 'out\perch'
+          foreach ($p in 'src\Perchd', 'src\Perch') {
+            dotnet publish $p -c Release -o $out --nologo
+            if ($LASTEXITCODE) { exit 1 }
+          }
+          & .\src\TaskbarTap\build.ps1 -out $out
+          Copy-Item README.md, LICENSE $out
+          Get-ChildItem $out | Format-Table Name, Length
+          Compress-Archive "$out\*" 'out\perch-win-x64.zip'
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: perch-win-x64
+          path: out/perch-win-x64.zip
+
+      - name: Publish the release
+        if: startsWith(github.ref, 'refs/tags/v')
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release create ${{ github.ref_name }} out/perch-win-x64.zip --title "perch ${{ github.ref_name }}" --generate-notes

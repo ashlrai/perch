@@ -25,7 +25,9 @@
   </PropertyGroup>
 
   <ItemGroup>
+    <InternalsVisibleTo Include="Perch.Tests" />
     <Compile Include="..\Shared\Proto.cs" />
+    <Compile Include="..\Shared\Rules.cs" />
   </ItemGroup>
 
 </Project>

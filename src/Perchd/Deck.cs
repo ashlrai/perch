@@ -151,7 +151,7 @@ static unsafe partial class App
         UpdateWindow(_scrim);   // paint now: posted animation ticks would starve WM_PAINT
     }
 
-    // ---- live pictures of the agents' editor/terminal windows
+    // ---- which window each agent runs in (for "Open in …" and quick replies). No pictures are taken.
 
     static Dictionary<string, (nint Hwnd, nint Img)> _prev = new();
     static Dictionary<string, (nint, nint)>? _prevNew;
@@ -163,7 +163,6 @@ static unsafe partial class App
         _prevAt = Model.Now;
         var want = new List<(string Key, uint Pid)>();
         foreach (var t in _terms) if (t.Pid != 0) want.Add((t.Key, t.Pid));
-        int pw = (int)((CW - SideW) * _s), ph = (int)((CH - 53) * _s);
         ThreadPool.UnsafeQueueUserWorkItem(_ =>
         {
             var res = new Dictionary<string, (nint, nint)>();
@@ -173,23 +172,22 @@ static unsafe partial class App
                 {
                     var wins = TopWindows();
                     var parents = Probe.ParentMap();
-                    var shots = new Dictionary<nint, nint>();
                     foreach (var (key, pid) in want)
                     {
+                        // walk up from the agent to the terminal/editor (or console) that owns its window; stop at
+                        // anything else, so a browser or an unrelated app's window is never picked
                         nint h = 0; uint p = pid;
                         for (int i = 0; i < 16 && p != 0; i++)
-                        {   // walk up from the agent process to the first one that owns a window
-                            if (wins.TryGetValue(p, out h)) break;
+                        {
+                            var kind = Probe.KindOf(p);
+                            if (kind is Probe.Kind.Host or Probe.Kind.Shell && wins.TryGetValue(p, out h)) break;
+                            h = 0;
+                            if (i > 0 && kind is not (Probe.Kind.Shell or Probe.Kind.Host or Probe.Kind.Agent)) break;
                             if (!parents.TryGetValue(p, out var pp) || pp == p) break;
                             p = pp;
                         }
-                        if (h == 0) continue;
-                        if (!shots.TryGetValue(h, out var img)) shots[h] = img = Gfx.CaptureWindow(h, pw, ph);
-                        else img = 0;   // same window as another agent: share the picture (owned by the first)
-                        res[key] = (h, img);
+                        if (h != 0) res[key] = (h, 0);
                     }
-                    foreach (var k in res.Keys.ToList())
-                        if (res[k].Item2 == 0 && shots.TryGetValue(res[k].Item1, out var s)) res[k] = (res[k].Item1, s);
                 }
             }
             catch { }
@@ -213,7 +211,6 @@ static unsafe partial class App
         if (n == null) return;
         FreePreviews(_prev);
         _prev = n;
-        RefreshTermText(false);   // now that the windows are known, read their text
         Invalidate();
     }
 
@@ -260,9 +257,8 @@ static unsafe partial class App
                     var hc = new HashCode();
                     hc.Add(t.State); hc.Add(t.Prompt); hc.Add(t.Tool); hc.Add(t.Msg); hc.Add(t.Host); hc.Add(t.Cwd); hc.Add(t.AskPort); hc.Add(t.Verdict);
                     hc.Add(StatusText(t, now)); hc.Add(BranchFor(t.Cwd)); hc.Add(t.Log?.Count ?? 0);
-                    hc.Add(_prev.TryGetValue(t.Key, out var pv) ? pv.Img : 0);
+                    hc.Add(_prev.TryGetValue(t.Key, out var pv) ? pv.Hwnd : 0);
                     hc.Add(Usage.Get(t.Transcript));
-                    hc.Add(TermText.Get(pv.Hwnd));
                     if (t.Log is { Count: > 0 } lg) hc.Add(lg[^1].Done);
                     hc.Add(_paneView); hc.Add(_tlScroll); hc.Add(t.AutoN); hc.Add(t.Changes); hc.Add(t.Since);
                     hc.Add(_confirm == "undo:" + t.Key && Model.Now - _confirmAt < 4000);
@@ -413,34 +409,90 @@ static unsafe partial class App
         _ => C.Light ? 0xFF3B3C44 : 0xFF1B1C20,
     };
 
-    /// The newest lines of a terminal, wrapped to the pane (monospace, so by character count), bottom-aligned.
-    /// Your prompts (">") and the agent's replies ("⏺") stand out; tool output ("⎿") and chrome stay quiet.
-    static void TermPane(Gfx g, string[] lines, float x, float y, float w, float h)
+    /// The session at a glance: the agent's mark in its state's colour, the task (your last prompt), what it's
+    /// doing now or what it said when it finished, a tally of the turn ("6 reads · 3 edits · 4 commands") and
+    /// its last few steps. Built from the transcript (or, without one, the hook log).
+    static void StoryPane(Gfx g, in Term t, Usage.Snap? u, float x, float y, float w, float h, long now)
     {
-        g.FillRect(x, y, w, h + ReplyH + 14, C.Light ? 0xFFF7F7F9 : 0xFF0B0B0D);
-        const float LH = 13.5f, PAD = 12;
-        float cw = g.Measure("0000000000", g.FMonoXs) / 10;
-        int cols = Math.Max(16, (int)((w - 2 * PAD) / MathF.Max(1, cw)));
-        int maxRows = Math.Max(1, (int)((h - 10) / LH));
-        // wrap from the bottom up until the pane is full
-        var rows = new List<(string Text, uint Col)>();
-        for (int i = lines.Length - 1; i >= 0 && rows.Count < maxRows; i--)
+        const float PAD = 18;
+        bool tl = u != null && u.Events.Length > 0;
+        float cx = x + PAD, cw = w - 2 * PAD, yy = y + (tl ? 46 : 20), bottom = y + h - 4;
+        var (word, col) = StateWord(t);
+        uint mark = col == C.Faint ? C.Dim : col;
+
+        // the mark, in a ring of the state's colour
+        float gx = cx + 18, gy = yy + 18;
+        g.Circle(gx, gy, 18, C.A(mark, 0.12f));
+        g.Arc(gx, gy, 17.5f, 0, 360, 1.4f, C.A(mark, t.State is "busy" or "wait" ? 0.7f : 0.35f));
+        Glyph(t.Name, gx, gy, 9, mark, g);
+        g.Text(AgentTitle(t.Name), g.FTitle, C.Text, cx + 46, yy - 1, cw - 46, 22);
+        string when = t.State is "busy" or "wait" ? " · " + Fmt.Clock(now - t.Since) : t.State == "done" ? " · " + Fmt.Ago(now - t.Since) : "";
+        g.Text(word + when + "  ·  " + t.Host, g.FSmall, col == C.Faint ? C.Dim : col, cx + 46, yy + 21, cw - 46, 16);
+        yy += 50;
+
+        if (!t.Hooked)
         {
-            string l = lines[i].Replace('\t', ' ');
-            string lt = l.TrimStart();
-            uint col = lt.StartsWith('>') ? C.Text
-                     : lt.StartsWith('⏺') || lt.StartsWith('●') ? C.Text
-                     : lt.StartsWith('⎿') ? C.Faint
-                     : lt.Length > 0 && "─│╭╮╰╯━┃".Contains(lt[0]) ? C.A(C.Faint, 0.7f)
-                     : C.Dim;
-            if (l.Length == 0) { rows.Add(("", col)); continue; }
-            var chunks = new List<string>();
-            for (int k = 0; k < l.Length; k += cols) chunks.Add(l.Substring(k, Math.Min(cols, l.Length - k)));
-            for (int k = chunks.Count - 1; k >= 0 && rows.Count < maxRows; k--) rows.Add((chunks[k], col));
+            g.TextWrap(t.Name.Contains("claude", StringComparison.OrdinalIgnoreCase)
+                ? "Run  perch hooks  and add it to your Claude Code settings to see what this session is working on."
+                : "Live summaries are shown for Claude Code sessions.", g.FSmall, C.Faint, cx, yy, cw, 50);
+            return;
         }
-        float yy = y + h - 4 - rows.Count * LH;
-        for (int i = rows.Count - 1; i >= 0; i--, yy += LH)
-            if (rows[i].Text.Length > 0) g.Text(rows[i].Text, g.FMonoXs, rows[i].Col, x + PAD, yy, w - PAD, LH + 2);
+
+        // this turn's events: everything after your last prompt
+        var evs = u?.Events ?? Array.Empty<Usage.Ev>();
+        int from = Array.FindLastIndex(evs, e => e.Kind == 'p');
+        var turn = from >= 0 ? evs[(from + 1)..] : evs;
+        string task = t.Prompt.Length > 0 ? t.Prompt : from >= 0 ? evs[from].Text : "";
+        if (task.Length > 0) { g.TextWrap(task, g.FUi, C.Text, cx, yy, cw, 36); yy += 42; }
+
+        // now / needs you / what it said at the end
+        string say = t.State switch
+        {
+            "busy" => Doing(t.Tool) + "…",
+            "wait" => t.Msg.Length > 0 ? t.Msg : "Waiting for you",
+            "done" => Array.FindLast(turn, e => e.Kind == 'r')?.Text ?? "Finished. Your turn.",
+            _ => "",
+        };
+        if (say.Length > 0)
+        {
+            uint sc = t.State == "busy" ? C.Run : t.State == "wait" ? C.Warn : C.Dim;
+            g.Line(cx + 0.5f, yy + 2, cx + 0.5f, yy + 40, 2, C.A(sc, 0.6f));   // a margin rule, like a quote
+            g.TextWrap(say, g.FSmall, t.State == "done" ? C.Dim : sc, cx + 10, yy, cw - 10, t.State == "done" ? 46 : 32);
+            yy += t.State == "done" ? 52 : 38;
+        }
+
+        // the tally of this turn's tool calls
+        var tools = turn.Where(e => e.Kind == 't').ToList();
+        var names = tools.Count > 0 ? tools.Select(e => e.Text.Split(' ', 2)[0]).ToList()
+                  : (t.Log ?? new()).Select(e => e.Tool).ToList();
+        int reads = names.Count(n => n is "Read" or "Grep" or "Glob" or "LS" or "NotebookRead");
+        int edits = names.Count(n => n is "Edit" or "Write" or "MultiEdit" or "NotebookEdit");
+        int cmds = names.Count(n => n is "Bash" or "PowerShell" or "BashOutput");
+        int web = names.Count(n => n is "WebFetch" or "WebSearch");
+        int other = names.Count - reads - edits - cmds - web;
+        var parts = new List<string>();
+        void P(int n, string one, string many) { if (n > 0) parts.Add($"{n} {(n == 1 ? one : many)}"); }
+        P(reads, "read", "reads"); P(edits, "edit", "edits"); P(cmds, "command", "commands"); P(web, "web lookup", "web lookups"); P(other, "other step", "other steps");
+        if (parts.Count > 0 && yy + 16 <= bottom) { g.Text(string.Join("  ·  ", parts), g.FLabel, C.Faint, cx, yy, cw, 16); yy += 22; }
+
+        // the last few steps, as many as fit
+        int fit = Math.Max(0, (int)((bottom - yy) / 16));
+        if (fit == 0) return;
+        if (tools.Count > 0)
+            foreach (var e in tools.Skip(Math.Max(0, tools.Count - fit)))
+            {
+                if (e.Dur < 0) g.Circle(cx + 3, yy + 8, 2.4f, C.Run); else Icon(Ico.Check, cx + 3, yy + 8, C.A(C.Ok, 0.7f), now, g);
+                g.Text(e.Text, g.FMonoXs, e.Dur < 0 ? C.Dim : C.Faint, cx + 13, yy, cw - 13, 16);
+                yy += 16;
+            }
+        else if (t.Log is { Count: > 0 } log)
+            foreach (var e in log.Skip(Math.Max(0, log.Count - fit)))
+            {
+                if (!e.Done) g.Circle(cx + 3, yy + 8, 2.4f, C.Run); else Icon(Ico.Check, cx + 3, yy + 8, C.A(C.Ok, 0.7f), now, g);
+                string line = e.Tool + "  " + (e.Detail.Contains('\\') || e.Detail.Contains('/') ? Fmt.Dir(e.Detail) : e.Detail);
+                g.Text(line, g.FMonoXs, e.Done ? C.Faint : C.Dim, cx + 13, yy, cw - 13, 16);
+                yy += 16;
+            }
     }
 
     static int _paneView, _tlScroll;     // agent cards' left pane: 0 terminal, 1 timeline; timeline rows scrolled up (PgUp/PgDn)
@@ -498,38 +550,11 @@ static unsafe partial class App
         TitleBar(project + " — " + t.Host, false);
         float lw = CW - SideW, top = 31, lh = CH - 31 - 22;
 
-        // left: the session's timeline (V), else the terminal's own text (live), else a picture of the window,
-        // else the activity log
-        _prev.TryGetValue(t.Key, out var pv);
-        var tt = TermText.Get(pv.Hwnd);
+        // left: a summary of the session (what it's on, what it did), or its timeline (V)
         var ut = Usage.Get(t.Transcript);
         bool hasTl = ut != null && ut.Events.Length > 0;
         if (hasTl && _paneView == 1) TimelinePane(g, ut!.Events, 0, top, lw, lh - ReplyH - 14, now);
-        else if (tt != null && tt.Lines.Length > 0) TermPane(g, tt.Lines, 0, top, lw, lh - ReplyH - 14);
-        else if (pv.Img != 0)
-            g.Image(pv.Img, 0, top, lw, lh, 0, 0, (int)(lw * _s), (int)((CH - 53) * _s), 5);
-        else
-        {
-            float y = top + 14;
-            var log = t.Log;
-            if (log != null && log.Count > 0)
-            {
-                int start = Math.Max(0, log.Count - 9);
-                for (int i = start; i < log.Count; i++)
-                {
-                    var e = log[i];
-                    string line = e.Tool == "Bash" ? "$ " + e.Detail : e.Tool + "  " + (e.Detail.Contains('\\') || e.Detail.Contains('/') ? Fmt.Dir(e.Detail) : e.Detail);
-                    if (e.Done) Icon(Ico.Check, 22, y + 9, C.Ok, now, g); else g.Circle(22, y + 9, 2.5f, t.State == "wait" ? C.Warn : C.Text);
-                    g.Text(line, g.FMonoSm, e.Done ? C.Dim : C.Text, 36, y, lw - 50, 18);
-                    y += 26;
-                }
-            }
-            else
-            {
-                Glyph(t.Name, lw / 2, top + lh / 2 - 16, 16, C.Mark, g);
-                g.Text(t.Hooked ? "No tool calls yet" : AgentTitle(t.Name) + " in " + t.Host, g.FSmall, C.Faint, 0, top + lh / 2 + 12, lw, 18, 1);
-            }
-        }
+        else StoryPane(g, t, ut, 0, top, lw, lh - ReplyH - 14, now);
 
         // right: the agent pane
         g.FillRect(lw, top, SideW, lh, C.Pane);
@@ -557,19 +582,6 @@ static unsafe partial class App
         }
         else sy += 2;
 
-        if (t.Hooked && t.Prompt.Length > 0)
-        {
-            g.Text("You", g.FSemi, C.Text, sx, sy, sw, 18); sy += 19;
-            float ph = u != null && u.Context > 0 ? 34 : 52;   // two lines when the meter takes room, else three
-            g.TextWrap(t.Prompt, g.FUi, C.Text, sx, sy, sw, ph); sy += ph + 6;
-        }
-        else if (!t.Hooked)
-        {
-            g.TextWrap(t.Name.Contains("claude", StringComparison.OrdinalIgnoreCase)
-                ? "Run  perch hooks  and add it to your Claude Code settings to see prompts, tool calls and approvals here."
-                : "Live prompts and tool calls are shown for Claude Code sessions.", g.FLabel, C.Faint, sx, sy, sw, 64);
-            sy += 70;
-        }
         var ch = t.State == "done" ? t.Changes : null;
         bool changed = ch is { Count: > 0 };
         if (changed)
@@ -589,11 +601,6 @@ static unsafe partial class App
             }
             sy += 4;
         }
-        else
-        {
-            string note = t.State switch { "busy" => Doing(t.Tool) + "…", "wait" => t.Msg, "done" => "Finished. Your turn.", _ => "" };
-            if (note.Length > 0) { g.TextWrap(note, g.FLabel, C.Faint, sx, sy, sw, 30); sy += note.Length > 34 ? 32 : 18; }
-        }
         if (t.AutoN > 0) { g.Text($"{t.AutoN} approved by your rules", g.FLabel, C.A(C.Ok, 0.8f), sx, sy, sw, 15); sy += 17; }
 
         // the command box, pinned to the bottom of the pane
@@ -605,24 +612,6 @@ static unsafe partial class App
         bool rules = ask && scope.Length > 0;
         float bh = (cmd.Length > 0 ? 50 : 30) + (ask ? 34 : 0) + (rules ? 30 : 0) + (changed ? 34 : 0), by = CH - 22 - 12 - bh, bx = sx - 2, bw = sw + 4;
 
-        // the last few tool calls, newest at the bottom, in whatever room is left above the command box
-        // (the window picture on the left hides the full log, so it's repeated here in short)
-        var recent = t.Log;
-        if (recent != null && recent.Count > 0 && _prev.TryGetValue(t.Key, out var pv2) && pv2.Img != 0)
-        {
-            int fit = Math.Clamp((int)((by - 6 - sy) / 17), 0, 3);
-            int skip = Math.Max(0, recent.Count - fit);
-            float ly0 = by - 6 - fit * 17;
-            for (int i = 0; i < fit && skip + i < recent.Count; i++)
-            {
-                var e = recent[skip + i];
-                float yy = ly0 + i * 17;
-                string line = e.Tool == "Bash" ? e.Detail : e.Tool + " " + (e.Detail.Contains('\\') || e.Detail.Contains('/') ? Fmt.Dir(e.Detail) : e.Detail);
-                if (e.Done) Icon(Ico.Check, sx + 3, yy + 8, C.A(C.Ok, 0.8f), now, g);
-                else g.Circle(sx + 3, yy + 8, 2.2f, t.State == "wait" ? C.Warn : C.Run);
-                g.Text(line, g.FMonoXs, e.Done ? C.Faint : C.Dim, sx + 13, yy, sw - 13, 16);
-            }
-        }
         bool amber = t.State == "wait" && t.Verdict.Length == 0;
         g.FillRR(bx, by, bw, bh, 9, amber ? C.WellWarn : C.Well);
         g.StrokeRR(bx + 0.5f, by + 0.5f, bw - 1, bh - 1, 8.5f, amber ? C.A(C.Warn, 0.42f) : C.Line, 1);
@@ -673,7 +662,7 @@ static unsafe partial class App
         if (hasTl)
         {   // Terminal / Timeline switch (V)
             float vx = 10, vy = top + 10;
-            foreach (var (name, v) in new[] { ("Terminal", 0), ("Timeline", 1) })
+            foreach (var (name, v) in new[] { ("Summary", 0), ("Timeline", 1) })
             {
                 float w = g.Measure(name, g.FLabel) + 16;
                 bool on = _paneView == v;
@@ -914,8 +903,8 @@ static unsafe partial class App
         if (s.Pid > 4)
         {   // stopping is destructive: the first press arms it, the second (within 4 s) does it
             bool sure = _confirm == "stop:" + port && Model.Now - _confirmAt < 4000;
-            bx -= Btn(c, bx, byy, sure ? "Stop it?" : "Stop", sure, HK.Stop, port) + 8;
-            if (by != null) Btn(c, bx, byy, "Restart", false, HK.Restart, port);
+            bx -= Btn(c, bx, byy, sure ? "Stop it?" : "Stop", sure, HK.Stop, port, "S") + 8;
+            if (by != null) Btn(c, bx, byy, "Restart", false, HK.Restart, port, "R");
         }
         FaceEdge();
         c.Act = HK.Server; c.Arg = port;
@@ -1232,7 +1221,6 @@ static unsafe partial class App
         if (i == _focus[_tab]) return;
         _focus[_tab] = i;
         _compose = null; _composeKey = "";
-        if (_tab == 0) RefreshTermText(true);
         _dhk = HK.None; _dharg = null;
         Invalidate();
     }
@@ -1260,8 +1248,13 @@ static unsafe partial class App
                     if (_viaHotkey && !Model.Agents.Exists(a => a.AskPort > 0 && a.State == "wait")) Collapse();
                 }
                 break;
-            case 0x52:                                                           // R: run the focused build again / review an agent's changes
-                if (_tab == 1 && _focus[1] < _cards.Count && _cards[_focus[1]] is { Act: HK.Rerun } rc) Rerun(rc.Arg);
+            case 0x53:                                                           // S (twice): stop the focused dev server
+                if (_tab == 2 && _focus[2] < _cards.Count && _cards[_focus[2]].Hits.Exists(h => h.K == HK.Stop) && Armed("stop:" + _cards[_focus[2]].Arg))
+                    StopServer(_cards[_focus[2]].Arg, false);
+                break;
+            case 0x52:                                                           // R: run the focused build again / review an agent's changes / restart a server
+                if (_tab == 2 && _focus[2] < _cards.Count && _cards[_focus[2]].Hits.Exists(h => h.K == HK.Restart)) StopServer(_cards[_focus[2]].Arg, true);
+                else if (_tab == 1 && _focus[1] < _cards.Count && _cards[_focus[1]] is { Act: HK.Rerun } rc) Rerun(rc.Arg);
                 else if (FocusedTerm() is { State: "done", Changes.Count: > 0 } rt) ReviewChanges(rt.Key);
                 break;
             case 0x4C: case 0x54:                                                // L / T: allow always / for 10 minutes
@@ -1342,7 +1335,7 @@ static unsafe partial class App
         byte* sa = stackalloc byte[16];
         new Span<byte>(sa, 16).Clear();
         sa[0] = 2; sa[2] = (byte)(a.AskPort >> 8); sa[3] = (byte)(a.AskPort & 0xFF); sa[4] = 127; sa[7] = 1;
-        var b = Encoding.ASCII.GetBytes(allow ? "allow" : "deny");
+        var b = Encoding.ASCII.GetBytes((allow ? "allow:" : "deny:") + a.AskToken);
         fixed (byte* p = b) sendto(_sock, p, b.Length, 0, sa, 16);
         a.Verdict = allow ? "allow" : "deny";
         a.AskPort = 0;
